@@ -144,6 +144,7 @@ class AutoGluonRAG:
         self.reranker_module = None
         self.retriever_module = None
         self.generator_module = None
+        self.agentic_module = None
 
         self.batch_size = pipeline_batch_size or self.args.pipeline_batch_size
 
@@ -408,27 +409,70 @@ class AutoGluonRAG:
         """
         return self.retriever_module.retrieve(query)
 
-    def generate_response(self, query: str) -> str:
+    def _agent_config(self) -> Dict[str, Any]:
+        """Assemble the agent configuration dict from Arguments."""
+        return {
+            "max_iterations": self.args.agent_max_iterations,
+            "max_subqueries": self.args.agent_max_subqueries,
+            "retrieve_top_k_per_query": self.args.agent_retrieve_top_k_per_query,
+            "max_context_tokens": self.args.agent_max_context_tokens,
+            "use_query_rewrite": self.args.agent_use_query_rewrite,
+            "use_context_compression": self.args.agent_use_context_compression,
+            "use_verification": self.args.agent_use_verification,
+            "min_evidence_count": self.args.agent_min_evidence_count,
+        }
+
+    def initialize_agentic_module(self):
+        """Initializes the Agentic RAG module, reusing the retriever and generator."""
+        from agrag.modules.agentic.agentic_module import AgenticRAGModule
+
+        self.agentic_module = AgenticRAGModule(
+            retriever_module=self.retriever_module,
+            generator_module=self.generator_module,
+            config=self._agent_config(),
+        )
+        logger.info("Agentic RAG module initialized")
+
+    def generate_response(self, query: str, mode: str = None, return_trace: bool = None):
         """
         Generates a response to the provided query using the Generator module.
 
-        This method first retrieves relevant context for the query using the Retriever module,
-        formats the query and context appropriately, and then generates a response using the Generator module.
+        By default this uses the standard RAG path: it retrieves relevant context
+        for the query using the Retriever module, formats the query and context
+        appropriately, and generates a response using the Generator module.
+
+        When ``mode="agentic"`` (or the ``agent`` config block enables it), the
+        request is routed to the Agentic RAG path instead, which supports
+        planning, multi-query retrieval, evidence tracking, answer verification,
+        and abstention.
 
         Parameters:
         ----------
         query : str
             The user query for which a response is to be generated.
+        mode : str, optional
+            "standard" (default) or "agentic". If not provided, falls back to the
+            ``agent.default_mode`` config value, or "agentic" when ``agent.enabled``
+            is set.
+        return_trace : bool, optional
+            Agentic mode only. When True, returns ``(answer, trace)`` where trace
+            is a serializable dict describing the run. Defaults to the
+            ``agent.return_trace`` config value.
 
         Returns:
         -------
-        str
-            The generated response.
+        str or Tuple[str, dict]
+            The generated response, or ``(response, trace)`` in agentic mode with
+            ``return_trace=True``.
 
         Example:
         --------
         response = agrag.generate_response("What is AutoGluon?")
+        response = agrag.generate_response("How should this repo support agents?", mode="agentic")
         """
+        resolved_mode = self._resolve_mode(mode)
+        if resolved_mode == "agentic":
+            return self._generate_response_agentic(query, return_trace=return_trace)
 
         retrieved_context = ""
         if self.retriever_module.top_k > 0:
@@ -446,6 +490,28 @@ class AutoGluonRAG:
         logger.info(f"\nResponse: {response}\n")
 
         return response
+
+    def _resolve_mode(self, mode: str = None) -> str:
+        """Resolve the answering mode from the explicit arg then config.
+
+        Precedence: explicit ``mode`` argument > ``agent.default_mode`` config >
+        "agentic" when ``agent.enabled`` is True > "standard".
+        """
+        if mode:
+            return mode
+        if self.args.agent_default_mode and self.args.agent_default_mode != "standard":
+            return self.args.agent_default_mode
+        if self.args.agent_enabled:
+            return "agentic"
+        return "standard"
+
+    def _generate_response_agentic(self, query: str, return_trace: bool = None):
+        """Route the query through the Agentic RAG path."""
+        if getattr(self, "agentic_module", None) is None:
+            self.initialize_agentic_module()
+        if return_trace is None:
+            return_trace = self.args.agent_return_trace
+        return self.agentic_module.answer(query, return_trace=return_trace)
 
     def batched_processing(self):
         """

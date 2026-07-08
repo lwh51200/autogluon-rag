@@ -73,7 +73,7 @@ class Reranker:
 
         self.model.eval()
 
-    def rerank(self, query: str, text_chunks: List[str]) -> List[str]:
+    def rerank(self, query: str, text_chunks: List[str], return_scores: bool = False):
         """
         Reranks the given text chunks based on their relevance to the query.
 
@@ -83,11 +83,17 @@ class Reranker:
             The query string for which the text chunks need to be reranked.
         text_chunks : List[str]
             The list of text chunks to be reranked.
+        return_scores : bool
+            If False (default), returns the sorted text chunks only, preserving
+            the original behavior. If True, returns a list of ``(chunk, score)``
+            tuples sorted by relevance, so callers (the agentic retrieval path)
+            can populate ``rerank_score`` on each ``Evidence``.
 
         Returns:
         -------
-        List[str]
-            A list of text chunks sorted by their relevance to the query.
+        List[str] or List[Tuple[str, float]]
+            Text chunks sorted by relevance, or ``(chunk, score)`` tuples when
+            ``return_scores`` is True. Both are truncated to ``top_k``.
         """
         scores = []
 
@@ -107,6 +113,9 @@ class Reranker:
 
         scored_chunks = list(zip(text_chunks, scores))
         scored_chunks.sort(key=lambda x: x[1], reverse=True)
+
+        if return_scores:
+            return scored_chunks[: self.top_k]
 
         sorted_text_chunks = [chunk for chunk, score in scored_chunks]
 

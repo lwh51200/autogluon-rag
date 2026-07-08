@@ -44,6 +44,7 @@ class Arguments:
         self.retriever_defaults = self._load_defaults(os.path.join(CURRENT_DIR, "configs/retriever/default.yaml"))
         self.generator_defaults = self._load_defaults(os.path.join(CURRENT_DIR, "configs/generator/default.yaml"))
         self.shared_defaults = self._load_defaults(os.path.join(CURRENT_DIR, "configs/shared/default.yaml"))
+        self.agent_defaults = self._load_defaults(os.path.join(CURRENT_DIR, "configs/agent/default.yaml"))
 
     def _parse_args(self) -> argparse.Namespace:
         parser = argparse.ArgumentParser(description="AutoGluon-RAG - Retrieval-Augmented Generation Pipeline")
@@ -75,6 +76,17 @@ class Arguments:
             "--data_dir",
             type=str,
             help="Directory containing files to use for RAG. Supports local or S3 paths.",
+            metavar="",
+        )
+        parser.add_argument(
+            "--mode",
+            type=str,
+            choices=["standard", "agentic"],
+            default=None,
+            help="Answering mode. 'standard' (default) uses the single-pass RAG path; "
+            "'agentic' uses the multi-step agentic RAG path (planning, multi-query "
+            "retrieval, verification, abstention). If omitted, the agent.default_mode / "
+            "agent.enabled config values decide.",
             metavar="",
         )
 
@@ -587,3 +599,101 @@ class Arguments:
     @generator_query_prefix.setter
     def generator_query_prefix(self, value):
         self.config["generator"]["generator_query_prefix"] = value
+
+    @property
+    def agent_enabled(self):
+        return self.config.get("agent", {}).get("enabled", self.agent_defaults.get("AGENT_ENABLED"))
+
+    @agent_enabled.setter
+    def agent_enabled(self, value):
+        self.config.setdefault("agent", {})["enabled"] = value
+
+    @property
+    def agent_default_mode(self):
+        return self.config.get("agent", {}).get("default_mode", self.agent_defaults.get("AGENT_DEFAULT_MODE"))
+
+    @agent_default_mode.setter
+    def agent_default_mode(self, value):
+        self.config.setdefault("agent", {})["default_mode"] = value
+
+    @property
+    def agent_max_iterations(self):
+        return self.config.get("agent", {}).get("max_iterations", self.agent_defaults.get("AGENT_MAX_ITERATIONS"))
+
+    @agent_max_iterations.setter
+    def agent_max_iterations(self, value):
+        self.config.setdefault("agent", {})["max_iterations"] = value
+
+    @property
+    def agent_max_subqueries(self):
+        return self.config.get("agent", {}).get("max_subqueries", self.agent_defaults.get("AGENT_MAX_SUBQUERIES"))
+
+    @agent_max_subqueries.setter
+    def agent_max_subqueries(self, value):
+        self.config.setdefault("agent", {})["max_subqueries"] = value
+
+    @property
+    def agent_retrieve_top_k_per_query(self):
+        return self.config.get("agent", {}).get(
+            "retrieve_top_k_per_query", self.agent_defaults.get("AGENT_RETRIEVE_TOP_K_PER_QUERY")
+        )
+
+    @agent_retrieve_top_k_per_query.setter
+    def agent_retrieve_top_k_per_query(self, value):
+        self.config.setdefault("agent", {})["retrieve_top_k_per_query"] = value
+
+    @property
+    def agent_max_context_tokens(self):
+        return self.config.get("agent", {}).get(
+            "max_context_tokens", self.agent_defaults.get("AGENT_MAX_CONTEXT_TOKENS")
+        )
+
+    @agent_max_context_tokens.setter
+    def agent_max_context_tokens(self, value):
+        self.config.setdefault("agent", {})["max_context_tokens"] = value
+
+    @property
+    def agent_use_query_rewrite(self):
+        return self.config.get("agent", {}).get(
+            "use_query_rewrite", self.agent_defaults.get("AGENT_USE_QUERY_REWRITE")
+        )
+
+    @agent_use_query_rewrite.setter
+    def agent_use_query_rewrite(self, value):
+        self.config.setdefault("agent", {})["use_query_rewrite"] = value
+
+    @property
+    def agent_use_context_compression(self):
+        return self.config.get("agent", {}).get(
+            "use_context_compression", self.agent_defaults.get("AGENT_USE_CONTEXT_COMPRESSION")
+        )
+
+    @agent_use_context_compression.setter
+    def agent_use_context_compression(self, value):
+        self.config.setdefault("agent", {})["use_context_compression"] = value
+
+    @property
+    def agent_use_verification(self):
+        return self.config.get("agent", {}).get("use_verification", self.agent_defaults.get("AGENT_USE_VERIFICATION"))
+
+    @agent_use_verification.setter
+    def agent_use_verification(self, value):
+        self.config.setdefault("agent", {})["use_verification"] = value
+
+    @property
+    def agent_min_evidence_count(self):
+        return self.config.get("agent", {}).get(
+            "min_evidence_count", self.agent_defaults.get("AGENT_MIN_EVIDENCE_COUNT")
+        )
+
+    @agent_min_evidence_count.setter
+    def agent_min_evidence_count(self, value):
+        self.config.setdefault("agent", {})["min_evidence_count"] = value
+
+    @property
+    def agent_return_trace(self):
+        return self.config.get("agent", {}).get("return_trace", self.agent_defaults.get("AGENT_RETURN_TRACE"))
+
+    @agent_return_trace.setter
+    def agent_return_trace(self, value):
+        self.config.setdefault("agent", {})["return_trace"] = value

@@ -1,0 +1,196 @@
+"""Structured evidence for the agentic RAG path.
+
+The standard retriever returns plain text chunks. The agentic path needs
+structured evidence so it can support citation, verification, trace export, and
+debugging. ``Evidence`` wraps a single retrieved chunk with its provenance and
+scoring metadata; ``EvidenceStore`` collects evidence for one query and
+deduplicates it by document/chunk identity.
+"""
+
+import logging
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional
+
+from agrag.constants import LOGGER_NAME
+
+logger = logging.getLogger(LOGGER_NAME)
+
+
+@dataclass
+class Evidence:
+    """A single piece of retrieved evidence.
+
+    Attributes:
+    ----------
+    evidence_id : str
+        Stable reference for citations and trace (assigned by ``EvidenceStore``).
+    text : str
+        Retrieved chunk content.
+    retrieval_query : str
+        The query that surfaced this evidence (may differ from the user query
+        when subqueries or rewrites are used).
+    rank : int
+        Position of this chunk within the results for ``retrieval_query``.
+        Enables ordering and debugging.
+    doc_id : Optional[int]
+        Source document identifier. Used for deduplication and provenance.
+    chunk_id : Optional[int]
+        Source chunk identifier within the document.
+    source : Optional[str]
+        Document path, URL, or file name. May be ``None`` until ingest-time
+        metadata is extended to carry provenance.
+    retrieval_score : Optional[float]
+        Similarity score from the vector database, if exposed.
+    rerank_score : Optional[float]
+        Score from the reranker, if a reranker was used.
+    tool_name : Optional[str]
+        Name of the tool that produced this evidence. Supports traceability.
+    used_in_answer : bool
+        Whether this evidence was cited in the final answer. Supports citation
+        precision and verifier output.
+    metadata : Dict[str, Any]
+        Any additional raw metadata carried from the vector database record.
+    """
+
+    text: str
+    retrieval_query: str = ""
+    rank: int = -1
+    doc_id: Optional[int] = None
+    chunk_id: Optional[int] = None
+    source: Optional[str] = None
+    retrieval_score: Optional[float] = None
+    rerank_score: Optional[float] = None
+    tool_name: Optional[str] = None
+    used_in_answer: bool = False
+    evidence_id: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def dedup_key(self) -> Any:
+        """Return the identity used for deduplication.
+
+        Prefers ``(doc_id, chunk_id)`` when both are present; otherwise falls
+        back to the chunk text so that identical text is not stored twice.
+        """
+        if self.doc_id is not None and self.chunk_id is not None:
+            return (self.doc_id, self.chunk_id)
+        return ("text", self.text)
+
+    def citation(self) -> str:
+        """Return a short human-readable citation reference.
+
+        Uses ``source`` when available, otherwise falls back to
+        ``doc_id``/``chunk_id`` (the MVP citation scheme).
+        """
+        if self.source:
+            return self.source
+        if self.doc_id is not None and self.chunk_id is not None:
+            return f"doc {self.doc_id}, chunk {self.chunk_id}"
+        return self.evidence_id or "unknown"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the evidence (used for trace export)."""
+        return asdict(self)
+
+    @classmethod
+    def from_retrieval_record(
+        cls,
+        record: Dict[str, Any],
+        retrieval_query: str,
+        rank: int,
+        tool_name: Optional[str] = None,
+    ) -> "Evidence":
+        """Build an ``Evidence`` object from a structured retrieval record.
+
+        The record is expected to carry the keys returned by the retriever when
+        ``return_metadata=True`` (``text``, and optionally ``doc_id``,
+        ``chunk_id``, ``retrieval_score``, ``rerank_score``, ``source``). Any
+        extra keys are preserved under ``metadata``.
+        """
+        known = {
+            "text",
+            "doc_id",
+            "chunk_id",
+            "source",
+            "retrieval_score",
+            "rerank_score",
+        }
+        extra = {k: v for k, v in record.items() if k not in known}
+        return cls(
+            text=record.get("text", ""),
+            retrieval_query=retrieval_query,
+            rank=rank,
+            doc_id=record.get("doc_id"),
+            chunk_id=record.get("chunk_id"),
+            source=record.get("source"),
+            retrieval_score=record.get("retrieval_score"),
+            rerank_score=record.get("rerank_score"),
+            tool_name=tool_name,
+            metadata=extra,
+        )
+
+
+class EvidenceStore:
+    """Holds structured evidence for a single query.
+
+    Deduplicates on ``Evidence.dedup_key()`` so the same chunk retrieved by
+    multiple subqueries is stored once. The first occurrence is kept; later
+    duplicates are dropped (their ranks/queries would otherwise be ambiguous).
+    """
+
+    def __init__(self) -> None:
+        self._evidence: List[Evidence] = []
+        self._seen: set = set()
+        self._counter: int = 0
+
+    def __len__(self) -> int:
+        return len(self._evidence)
+
+    def __iter__(self):
+        return iter(self._evidence)
+
+    def add(self, evidence: Evidence) -> bool:
+        """Add one piece of evidence.
+
+        Returns ``True`` if it was stored, ``False`` if it was a duplicate.
+        Assigns a stable ``evidence_id`` when the item is stored.
+        """
+        key = evidence.dedup_key()
+        if key in self._seen:
+            logger.debug("Skipping duplicate evidence with key %s", key)
+            return False
+        self._seen.add(key)
+        if evidence.evidence_id is None:
+            evidence.evidence_id = f"e{self._counter}"
+        self._counter += 1
+        self._evidence.append(evidence)
+        return True
+
+    def add_many(self, evidence_items: List[Evidence]) -> int:
+        """Add multiple items; return the count actually stored (non-duplicate)."""
+        return sum(1 for item in evidence_items if self.add(item))
+
+    def all(self) -> List[Evidence]:
+        """Return all stored evidence in insertion order."""
+        return list(self._evidence)
+
+    def get(self, evidence_id: str) -> Optional[Evidence]:
+        """Return the evidence with the given id, or ``None``."""
+        for item in self._evidence:
+            if item.evidence_id == evidence_id:
+                return item
+        return None
+
+    def texts(self) -> List[str]:
+        """Return the raw text of all stored evidence (for prompt building)."""
+        return [item.text for item in self._evidence]
+
+    def mark_used(self, evidence_ids: List[str]) -> None:
+        """Mark the given evidence ids as used in the answer."""
+        wanted = set(evidence_ids)
+        for item in self._evidence:
+            if item.evidence_id in wanted:
+                item.used_in_answer = True
+
+    def to_list(self) -> List[Dict[str, Any]]:
+        """Serialize all evidence to plain dicts (for trace export)."""
+        return [item.to_dict() for item in self._evidence]

@@ -238,6 +238,7 @@ class DataProcessingModule:
             "doc_id": [doc_id] * len(chunked_text_content),
             "chunk_id": list(range(len(chunked_text_content))),
             "text": chunked_text_content,
+            "source": [url] * len(chunked_text_content),
         }
 
         return pd.DataFrame(data)

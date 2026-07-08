@@ -58,6 +58,23 @@ class TestReranker(unittest.TestCase):
 
         self.assertEqual(sorted_text_chunks, ["test chunk 2"])
 
+    def test_rerank_return_scores(self):
+        query = "Some query"
+        text_chunks = ["test chunk 1", "test chunk 2"]
+
+        self.mock_tokenizer.return_value = {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "attention_mask": torch.tensor([[1, 1, 1], [1, 1, 1]]),
+        }
+
+        with patch.object(self.reranker, "model", return_value=[torch.tensor([[0.1], [0.2]])]):
+            scored = self.reranker.rerank(query, text_chunks, return_scores=True)
+
+        # Returns (text, score) tuples sorted by descending score.
+        self.assertEqual([t for t, _ in scored], ["test chunk 2", "test chunk 1"])
+        self.assertAlmostEqual(scored[0][1], 0.2, places=5)
+        self.assertAlmostEqual(scored[1][1], 0.1, places=5)
+
 
 if __name__ == "__main__":
     unittest.main()

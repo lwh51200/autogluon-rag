@@ -1,0 +1,15 @@
+# Default configuration for the optional Agentic RAG path.
+# The agentic path is OFF by default; the standard RAG path remains the default
+# behavior of generate_response(query). Agentic behavior runs only when enabled
+# here or when generate_response is called with mode="agentic".
+AGENT_ENABLED: false
+AGENT_DEFAULT_MODE: standard
+AGENT_MAX_ITERATIONS: 5
+AGENT_MAX_SUBQUERIES: 4
+AGENT_RETRIEVE_TOP_K_PER_QUERY: 8
+AGENT_MAX_CONTEXT_TOKENS: 6000
+AGENT_USE_QUERY_REWRITE: true
+AGENT_USE_CONTEXT_COMPRESSION: false
+AGENT_USE_VERIFICATION: true
+AGENT_MIN_EVIDENCE_COUNT: 2
+AGENT_RETURN_TRACE: false

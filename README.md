@@ -63,6 +63,61 @@ if __name__ == "__main__":
     ag_rag()
 ```
 
+### Agentic RAG (optional)
+
+In addition to the standard single-pass pipeline (retrieve → generate), AutoGluon-RAG
+provides an optional **agentic RAG** path. Instead of answering in one shot, the agent
+runs a short, bounded reasoning loop that can plan subqueries, retrieve for each of them,
+rewrite the query when retrieval is weak, verify that the draft answer is supported by the
+retrieved evidence, and **abstain** when the evidence is insufficient rather than
+hallucinate. The agentic path reuses the same retriever and generator as the standard
+pipeline — no re-ingesting, re-chunking, or re-embedding is performed.
+
+The standard path remains the default. Enable the agentic path per call:
+
+```python
+from agrag.agrag import AutoGluonRAG
+
+agrag = AutoGluonRAG(preset_quality="medium_quality", data_dir="/path/to/docs")
+agrag.initialize_rag_pipeline()
+
+# Standard single-pass RAG (default)
+agrag.generate_response("What is AutoGluon?")
+
+# Agentic RAG for this query
+answer = agrag.generate_response("What is AutoGluon and how does it compare to AutoKeras?", mode="agentic")
+
+# Ask for a structured trace (plan, steps, evidence, verification, metrics)
+answer, trace = agrag.generate_response("What is AutoGluon?", mode="agentic", return_trace=True)
+```
+
+From the command line, pass `--mode agentic` to route queries through the agentic path:
+
+```bash
+agrag --mode agentic
+```
+
+You can also make agentic the default by setting the `agent` block in your config file
+(`enabled: true` or `default_mode: agentic`). The full set of agent parameters and their
+defaults lives in `src/agrag/configs/agent/default.yaml`:
+
+```yaml
+agent:
+  enabled: false            # if true, generate_response uses the agentic path by default
+  default_mode: standard    # "standard" or "agentic"
+  max_iterations: 5         # hard cap on reasoning-loop iterations
+  max_subqueries: 4         # max planned subqueries per query
+  retrieve_top_k_per_query: 8
+  max_context_tokens: 6000  # approximate context budget for synthesis
+  use_query_rewrite: true   # allow rewriting the query after weak retrieval
+  use_context_compression: false
+  use_verification: true    # LLM-judge verification of the draft answer
+  min_evidence_count: 2     # minimum evidence required before answering
+  return_trace: false       # return (answer, trace) instead of just answer
+```
+
+A runnable, fully-local CPU example (no cloud keys required) lives in `local_example/`.
+
 For a list of configurable parameters that can be passed into the `AutoGluonRAG` class, refer to the tutorial [here](https://github.com/autogluon/autogluon-rag/tree/main/documentation/tutorials/general/code_parameteres.md). 
 
 You can also use a configuration file with `AutoGluonRAG`.

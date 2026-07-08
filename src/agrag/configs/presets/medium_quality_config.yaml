@@ -59,3 +59,18 @@ generator:
     hf_generate_params:
       max_new_tokens: 1024
   generator_query_prefix: You are a helpful chat assistant. You will be provided with a query and you must answer it to the best of your abilities. You will be provided with some additional context that is related to the query and will help you answer the question.
+
+agent:
+  # Optional Agentic RAG path. Disabled by default; the standard RAG path remains
+  # the default behavior. Enable here or call generate_response(mode="agentic").
+  enabled: false
+  default_mode: standard
+  max_iterations: 5
+  max_subqueries: 4
+  retrieve_top_k_per_query: 8
+  max_context_tokens: 6000
+  use_query_rewrite: true
+  use_context_compression: false
+  use_verification: true
+  min_evidence_count: 2
+  return_trace: false

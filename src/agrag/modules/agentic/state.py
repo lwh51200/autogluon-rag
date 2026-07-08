@@ -1,0 +1,221 @@
+"""Per-query runtime state for the agentic RAG path.
+
+``AgentState`` holds everything the agent loop needs for a *single* query: the
+original and current query text, the retrieval plan and subqueries, the running
+log of actions/observations, evidence ids, the draft answer, the verification
+result, the iteration count, and the final status. It is intentionally
+short-lived — one instance per ``generate_response`` call — and must not be used
+as long-term or cross-query memory.
+"""
+
+import logging
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from agrag.constants import LOGGER_NAME
+
+logger = logging.getLogger(LOGGER_NAME)
+
+
+class AgentStatus(str, Enum):
+    """Terminal or in-progress status of an agentic run."""
+
+    IN_PROGRESS = "in_progress"
+    ANSWERED = "answered"
+    ABSTAINED = "abstained"
+    MAX_ITERATIONS = "max_iterations"
+
+
+@dataclass
+class ActionRecord:
+    """One (action, observation) step in the agent loop.
+
+    Attributes:
+    ----------
+    iteration : int
+        The loop iteration in which this step occurred.
+    action_type : str
+        The action requested by the policy (e.g. "retrieve", "draft_answer").
+    tool_name : Optional[str]
+        The tool invoked for this action, if any.
+    args : Dict[str, Any]
+        Arguments passed to the tool/action.
+    observation_summary : str
+        A short, serializable summary of the observation (not the full payload).
+    evidence_added : int
+        How many new (non-duplicate) evidence items this step contributed.
+    query : str
+        The working query in effect when this step ran. Lets the policy tell
+        whether retrieval has already happened for the *current* query (so a
+        rewrite triggers fresh retrieval rather than dead-ending).
+    """
+
+    iteration: int
+    action_type: str
+    tool_name: Optional[str] = None
+    args: Dict[str, Any] = field(default_factory=dict)
+    observation_summary: str = ""
+    evidence_added: int = 0
+    query: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class AgentState:
+    """Runtime state for answering one query.
+
+    Attributes:
+    ----------
+    original_query : str
+        The user's query, never mutated after construction.
+    current_query : str
+        The query currently being acted on (may be rewritten during the loop).
+    plan : List[str]
+        Retrieval queries produced by the planner.
+    subqueries : List[str]
+        Subqueries generated for multi-query retrieval.
+    history : List[ActionRecord]
+        Ordered log of actions and observation summaries.
+    evidence_ids : List[str]
+        Ids of evidence collected so far (mirrors the EvidenceStore contents).
+    draft_answer : Optional[str]
+        The most recent draft answer, if one has been synthesized.
+    verification : Optional[Dict[str, Any]]
+        The most recent verification result (label + details) for the *current*
+        query. Reset to None on a rewrite so a stale rejection does not keep
+        forcing rewrites. Use ``last_verification`` for debugging/trace instead.
+    last_verification : Optional[Dict[str, Any]]
+        The most recent verification result of the whole run, preserved across
+        rewrites. Purely informational (trace/debugging); the policy never reads
+        it. Lets the trace show what the final draft's verification was even when
+        the run ended just after a rewrite cleared ``verification``.
+    compressed_context : Optional[str]
+        Context produced by the context-compression tool, if any. Reset to None
+        whenever new evidence is retrieved so it never goes stale.
+    iteration : int
+        Current loop iteration (0-based).
+    status : AgentStatus
+        Current status of the run.
+    """
+
+    original_query: str
+    current_query: str = ""
+    plan: List[str] = field(default_factory=list)
+    subqueries: List[str] = field(default_factory=list)
+    history: List[ActionRecord] = field(default_factory=list)
+    evidence_ids: List[str] = field(default_factory=list)
+    draft_answer: Optional[str] = None
+    verification: Optional[Dict[str, Any]] = None
+    last_verification: Optional[Dict[str, Any]] = None
+    compressed_context: Optional[str] = None
+    iteration: int = 0
+    status: AgentStatus = AgentStatus.IN_PROGRESS
+
+    def __post_init__(self) -> None:
+        if not self.current_query:
+            self.current_query = self.original_query
+
+    def record_action(
+        self,
+        action_type: str,
+        tool_name: Optional[str] = None,
+        args: Optional[Dict[str, Any]] = None,
+        observation_summary: str = "",
+        evidence_added: int = 0,
+    ) -> ActionRecord:
+        """Append an (action, observation) step to the history and return it."""
+        record = ActionRecord(
+            iteration=self.iteration,
+            action_type=action_type,
+            tool_name=tool_name,
+            args=args or {},
+            observation_summary=observation_summary,
+            evidence_added=evidence_added,
+            query=self.current_query,
+        )
+        self.history.append(record)
+        return record
+
+    def add_evidence_ids(self, evidence_ids: List[str]) -> None:
+        """Track newly stored evidence ids (dedup against existing)."""
+        for eid in evidence_ids:
+            if eid not in self.evidence_ids:
+                self.evidence_ids.append(eid)
+
+    def set_verification(self, verification: Optional[Dict[str, Any]]) -> None:
+        """Record a verification result.
+
+        Sets both the current-query ``verification`` (which the policy reads and
+        which is cleared on a rewrite) and ``last_verification`` (which persists
+        across rewrites for the trace).
+        """
+        self.verification = verification
+        if verification is not None:
+            self.last_verification = verification
+
+    def set_current_query(self, query: str) -> None:
+        """Update the working query (e.g. after a rewrite).
+
+        Resets the per-query working artifacts that pertain to the previous
+        query: the compressed context, the draft answer, and its verification.
+        Otherwise a stale "unsupported" verdict would keep forcing rewrites even
+        after fresh evidence has been retrieved for the new query.
+        """
+        self.current_query = query
+        self.compressed_context = None
+        self.draft_answer = None
+        self.verification = None
+
+    def retrieved_for_current_query(self) -> bool:
+        """Whether a retrieval step has already run for the current query.
+
+        A rewrite changes ``current_query``; because each ``ActionRecord`` stores
+        the query in effect when it ran, this returns False again after a rewrite,
+        which lets the policy retrieve afresh with the rewritten query.
+        """
+        retrieval_actions = ("retrieve", "multi_retrieve")
+        return any(
+            record.action_type in retrieval_actions and record.query == self.current_query
+            for record in self.history
+        )
+
+    def draft_attempts(self) -> int:
+        """Number of draft-answer steps recorded so far."""
+        return sum(1 for record in self.history if record.action_type == "draft_answer")
+
+    @property
+    def tool_call_count(self) -> int:
+        """Number of steps in history that invoked a tool."""
+        return sum(1 for record in self.history if record.tool_name is not None)
+
+    @property
+    def evidence_count(self) -> int:
+        return len(self.evidence_ids)
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status != AgentStatus.IN_PROGRESS
+
+    def finish(self, status: AgentStatus) -> None:
+        """Mark the run terminal with the given status."""
+        self.status = status
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the full state (used for trace export)."""
+        return {
+            "original_query": self.original_query,
+            "current_query": self.current_query,
+            "plan": list(self.plan),
+            "subqueries": list(self.subqueries),
+            "history": [record.to_dict() for record in self.history],
+            "evidence_ids": list(self.evidence_ids),
+            "draft_answer": self.draft_answer,
+            "verification": self.verification,
+            "last_verification": self.last_verification,
+            "compressed_context": self.compressed_context,
+            "iteration": self.iteration,
+            "status": self.status.value,
+        }
