@@ -49,11 +49,18 @@ class AnswerVerifier:
     min_evidence_count : int
         If fewer than this many evidence items are available, the verifier short
         circuits to ``insufficient_evidence`` without calling the model.
+    max_context_tokens : int
+        Approximate cap on the size of the evidence block placed in the verifier
+        prompt (approximated by whitespace token count, matching the
+        synthesizer). Prevents concatenating unbounded evidence into a single
+        prompt, which would overflow the model's context window. At least the
+        first evidence item is always included.
     """
 
-    def __init__(self, generator_module, min_evidence_count: int = 2):
+    def __init__(self, generator_module, min_evidence_count: int = 2, max_context_tokens: int = 6000):
         self.generator_module = generator_module
         self.min_evidence_count = min_evidence_count
+        self.max_context_tokens = max_context_tokens
 
     @staticmethod
     def _parse_label(text: str) -> VerificationLabel:
@@ -64,6 +71,25 @@ class AnswerVerifier:
                 return label
         logger.debug("Verifier could not parse label from %r; defaulting to unsupported", text)
         return VerificationLabel.UNSUPPORTED
+
+    def _build_evidence_block(self, evidence_store: EvidenceStore) -> str:
+        """Join evidence text into a bounded block for the verifier prompt.
+
+        Includes evidence in order until the approximate token budget
+        (whitespace-delimited words) is reached, always keeping at least the
+        first item. Mirrors ``AnswerSynthesizer._select_evidence`` so the
+        verifier judges against the same slice of evidence the answer was
+        grounded in.
+        """
+        lines = []
+        used = 0
+        for ev in evidence_store:
+            approx_tokens = len(ev.text.split())
+            if lines and used + approx_tokens > self.max_context_tokens:
+                break
+            lines.append(f"- {ev.text}")
+            used += approx_tokens
+        return "\n".join(lines)
 
     def verify(self, query: str, draft_answer: str, evidence_store: EvidenceStore) -> Dict[str, Any]:
         """Return a verification result dict with a structured label.
@@ -79,7 +105,7 @@ class AnswerVerifier:
             label = VerificationLabel.INSUFFICIENT_EVIDENCE
             return self._result(label, evidence_count)
 
-        evidence_block = "\n".join(f"- {ev.text}" for ev in evidence_store)
+        evidence_block = self._build_evidence_block(evidence_store)
         prompt = f"{_VERIFY_INSTRUCTION}QUESTION: {query}\n\nANSWER: {draft_answer}\n\n" f"EVIDENCE:\n{evidence_block}"
         raw = self.generator_module.generate_response(prompt)
         label = self._parse_label(raw)

@@ -76,7 +76,11 @@ class AgenticRAGModule:
         self.planner = QueryPlanner(max_subqueries=self.max_subqueries)
         self.synthesizer = AnswerSynthesizer(self.generator_module, max_context_tokens=self.max_context_tokens)
         self.verifier = (
-            AnswerVerifier(self.generator_module, min_evidence_count=self.min_evidence_count)
+            AnswerVerifier(
+                self.generator_module,
+                min_evidence_count=self.min_evidence_count,
+                max_context_tokens=self.max_context_tokens,
+            )
             if self.use_verification
             else None
         )

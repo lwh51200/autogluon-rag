@@ -99,6 +99,27 @@ class TestAnswerVerifier(unittest.TestCase):
         result = verifier.verify("q", "draft", _store("a"))
         self.assertEqual(result["label"], "unsupported")
 
+    def test_evidence_block_bounded_by_context_budget(self):
+        # Two multi-word chunks; a tiny budget must drop the second chunk from
+        # the verifier prompt so it does not concatenate all evidence unbounded.
+        gen = FakeGenerator("supported")
+        verifier = AnswerVerifier(gen, min_evidence_count=2, max_context_tokens=3)
+        result = verifier.verify("q", "draft", _store("one two three four five", "second chunk here"))
+        # Verifier still runs (enough evidence to satisfy min_evidence_count).
+        self.assertEqual(result["label"], "supported")
+        prompt = gen.prompts[0]
+        self.assertIn("one two three four five", prompt)
+        self.assertNotIn("second chunk here", prompt)
+
+    def test_evidence_block_keeps_first_item_over_budget(self):
+        # Even when the first chunk alone exceeds the budget, it is kept (so the
+        # verifier always has something to judge against).
+        gen = FakeGenerator("supported")
+        verifier = AnswerVerifier(gen, min_evidence_count=1, max_context_tokens=2)
+        result = verifier.verify("q", "draft", _store("a big first chunk with many words"))
+        self.assertEqual(result["label"], "supported")
+        self.assertIn("a big first chunk with many words", gen.prompts[0])
+
 
 class TestDecisionPolicy(unittest.TestCase):
     def test_first_action_single_retrieve(self):
