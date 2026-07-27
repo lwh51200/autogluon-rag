@@ -117,7 +117,7 @@ class EvaluationModule:
 
         current_file.close()
 
-    def get_queries_and_responses(self, query_fn: Callable, response_fn: Callable):
+    def get_queries_and_responses(self, query_fn: Callable, response_fn: Callable, mode: str = None):
         """
         Obtains the queries and responses from the dataset.
 
@@ -127,6 +127,10 @@ class EvaluationModule:
             A function to extract the query from the dataset row.
         response_fn : Callable
             A function to extract the expected responses from the dataset row.
+        mode : str, optional
+            Answering mode passed through to ``generate_response``. ``None``
+            (default) preserves the standard RAG path; pass ``"agentic"`` to
+            evaluate the Agentic RAG path over the same dataset and settings.
 
         Returns:
         -------
@@ -146,7 +150,7 @@ class EvaluationModule:
             if not expected_responses:
                 continue
 
-            generated_response = self.agrag.generate_response(query)
+            generated_response = self.agrag.generate_response(query, mode=mode)
             references.append(expected_responses)
             predictions.append(generated_response)
             queries.append(query)
@@ -277,6 +281,7 @@ class EvaluationModule:
         evaluation_dir: str = EVALUATION_DIR,
         save_csv_path: str = None,
         max_eval_size: int = None,
+        mode: str = None,
     ):
         """
         Runs the evaluation process.
@@ -323,6 +328,10 @@ class EvaluationModule:
         max_eval_size : int, optional
             The maximum number of datapoints to process for evaluation (default is None).
             This value should be less than the total number of datapoints.
+        mode : str, optional
+            Answering mode forwarded to ``generate_response``. ``None`` (default)
+            uses the standard RAG path; ``"agentic"`` routes to the Agentic RAG
+            path so both systems can be benchmarked on the same dataset/settings.
         """
         self.dataset_name = dataset_name
         self.metrics = metrics
@@ -353,8 +362,11 @@ class EvaluationModule:
             logger.info("\nAutoGluon-RAG pipeline already initialized...Skipping")
 
         queries, expected_repsonses, generated_responses = self.get_queries_and_responses(
-            query_fn=self.query_fn, response_fn=self.response_fn
+            query_fn=self.query_fn, response_fn=self.response_fn, mode=mode
         )
-        self.evaluate_responses(predictions=generated_responses, references=expected_repsonses, queries=queries)
+        results = self.evaluate_responses(
+            predictions=generated_responses, references=expected_repsonses, queries=queries
+        )
         if self.save_csv_path:
             self.save_evaluation_results(output_csv=self.save_csv_path, references=expected_repsonses, queries=queries)
+        return results

@@ -578,7 +578,10 @@ class Arguments:
 
     @property
     def generator_model_platform_args(self):
-        return self.config.get("generator", {}).get("generator_model_platform_args", {})
+        return self.config.get("generator", {}).get(
+            "generator_model_platform_args",
+            self.generator_defaults.get("DEFAULT_GENERATOR_MODEL_PLATFORM_ARGS", {}),
+        )
 
     @generator_model_platform_args.setter
     def generator_model_platform_args(self, value):
