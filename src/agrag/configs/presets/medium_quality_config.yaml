@@ -37,7 +37,7 @@ retriever:
   retriever_top_k: 20
   use_reranker: true
   reranker_top_k: 10
-  reranker_model_name: BAAI/bge-large-en
+  reranker_model_name: BAAI/bge-reranker-large
   reranker_model_platform: huggingface
   reranker_batch_size: 32
   num_gpus: 0

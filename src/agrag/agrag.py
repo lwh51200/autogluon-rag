@@ -420,6 +420,9 @@ class AutoGluonRAG:
             "use_context_compression": self.args.agent_use_context_compression,
             "use_verification": self.args.agent_use_verification,
             "min_evidence_count": self.args.agent_min_evidence_count,
+            # Share the standard-path query prefix so answer formatting is
+            # consistent across standard and agentic modes.
+            "query_prefix": self.args.generator_query_prefix,
         }
 
     def initialize_agentic_module(self):

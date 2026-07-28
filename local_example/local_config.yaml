@@ -1,0 +1,66 @@
+shared:
+  pipeline_batch_size: 0   # 0 = no batching; process everything at once
+
+data:
+  chunk_size: 128
+  chunk_overlap: 16
+  file_extns:
+    - "txt"
+
+embedding:
+  # Small HuggingFace embedding model that runs on CPU
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  embedding_model_platform: huggingface
+  embedding_model_platform_args:
+    hf_tokenizer_params:
+      truncation: true
+      padding: true
+  pooling_strategy: mean
+  normalize_embeddings: false   # upstream normalize_embedding() has a kwargs bug; skip it
+  normalization_params: {'p': 2, 'dim': 1, 'eps': 1e-12}
+  embedding_batch_size: 32
+
+vector_db:
+  db_type: faiss
+  params: {gpu: False}
+  similarity_threshold: 0.95
+  similarity_fn: cosine
+  faiss_index_type: IndexFlatL2
+  use_existing_vector_db: false
+  save_index: true
+  num_gpus: 0
+  vector_db_index_save_path: local_example/vector_db_index/index.idx
+  metadata_index_save_path: local_example/vector_db_metadata/metadata.json
+  vector_db_index_load_path: local_example/vector_db_index/index.idx
+  metadata_index_load_path: local_example/vector_db_metadata/metadata.json
+
+retriever:
+  retriever_top_k: 5
+  use_reranker: false   # skip reranker to keep it fast/light on CPU
+  reranker_top_k: 3
+  reranker_model_name: BAAI/bge-large-en
+  reranker_model_platform: huggingface
+  reranker_batch_size: 8
+  num_gpus: 0
+
+generator:
+  # Real generator via AWS Bedrock (Claude Haiku 4.5) for meaningful answers.
+  # Active Bedrock Claude models require the "us." inference-profile prefix.
+  # For a fully-local/no-creds run, swap back to sshleifer/tiny-gpt2 (huggingface).
+  generator_model_name: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  generator_model_platform: bedrock
+  num_gpus: 0
+  generator_model_platform_args:
+    bedrock_aws_region: us-west-2
+    bedrock_generate_params:
+      max_tokens: 1024
+      anthropic_version: "bedrock-2023-05-31"
+  # Terse-answer prefix mirrors the original Google NQ evaluation setup so
+  # answers are short enough for exact-match scoring.
+  generator_query_prefix: >
+    You will be answering questions based on Wikipedia articles. Your response
+    must contain only the actual answer itself and no extra information or words.
+    Provide just the answer instead of forming full sentences. Your answer may
+    even be a singular word or number. For example, if the query is "what
+    percentage of the earth's surface is water?", your response must simply be
+    'roughly 78%', or '78%'.

@@ -13,13 +13,18 @@ from agrag.modules.vector_db.vector_database import VectorDatabaseModule
 
 
 class TestRetrieverModule(unittest.TestCase):
+    @patch("agrag.modules.retriever.rerankers.reranker.AutoTokenizer.from_pretrained")
+    @patch("agrag.modules.retriever.rerankers.reranker.AutoModelForSequenceClassification.from_pretrained")
     @patch("agrag.modules.embedding.embedding.AutoTokenizer.from_pretrained")
     @patch("agrag.modules.embedding.embedding.AutoModel.from_pretrained")
-    def setUp(self, mock_model, mock_tokenizer):
+    def setUp(self, mock_model, mock_tokenizer, mock_reranker_model, mock_reranker_tokenizer):
         self.mock_tokenizer = MagicMock()
         self.mock_model = MagicMock()
         mock_tokenizer.return_value = self.mock_tokenizer
         mock_model.return_value = self.mock_model
+        # The reranker loads its own cross-encoder; mock it so no model is downloaded.
+        mock_reranker_model.return_value = MagicMock()
+        mock_reranker_tokenizer.return_value = MagicMock()
 
         self.embedding_module = EmbeddingModule(
             hf_model="some-model",

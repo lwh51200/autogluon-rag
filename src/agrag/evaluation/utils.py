@@ -161,10 +161,13 @@ def qa_metric_score(
 
 
 def save_responses_to_csv(
-    generated_responses: List[str], expected_responses: List[List[str]], exact_matches: List[bool], output_csv: str
+    generated_responses: List[str], expected_responses: List[List[str]], queries: List[str], output_csv: str
 ):
     """
-    Saves the evaluation results to a CSV file.
+    Saves the evaluation predictions to a CSV file.
+
+    One row per evaluated example, capturing the query, the model's generated
+    response, and the expected (reference) responses so results are inspectable.
 
     Parameters:
     ----------
@@ -172,14 +175,14 @@ def save_responses_to_csv(
         The generated responses.
     expected_responses : List[List[str]]
         The expected responses.
-    exact_matches : List[bool]
-        The exact match results.
+    queries : List[str]
+        The original queries for each response.
     output_csv : str
         The path to the output CSV file.
     """
     with open(output_csv, mode="w", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow(["Generated Response", "Expected Responses", "Exact Match"])
+        writer.writerow(["Query", "Generated Response", "Expected Responses"])
 
-        for gen_resp, exp_resps, match in zip(generated_responses, expected_responses, exact_matches):
-            writer.writerow([gen_resp, "; ".join(exp_resps), match])
+        for query, gen_resp, exp_resps in zip(queries, generated_responses, expected_responses):
+            writer.writerow([query, gen_resp, "; ".join(exp_resps)])

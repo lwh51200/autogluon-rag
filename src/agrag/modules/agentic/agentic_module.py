@@ -43,7 +43,7 @@ class AgenticRAGModule:
         Agent configuration (see configs/agent/default.yaml). Recognized keys:
         max_iterations, max_subqueries, retrieve_top_k_per_query,
         use_query_rewrite, use_context_compression, use_verification,
-        min_evidence_count, max_context_tokens.
+        min_evidence_count, max_context_tokens, query_prefix.
     """
 
     def __init__(self, retriever_module, generator_module, config: Optional[Dict[str, Any]] = None):
@@ -59,6 +59,7 @@ class AgenticRAGModule:
         self.use_verification = cfg.get("use_verification", True)
         self.min_evidence_count = cfg.get("min_evidence_count", 2)
         self.max_context_tokens = cfg.get("max_context_tokens", 6000)
+        self.query_prefix = cfg.get("query_prefix", "")
 
         self._build_components()
 
@@ -74,7 +75,11 @@ class AgenticRAGModule:
         self.tool_registry = ToolRegistry(tools)
 
         self.planner = QueryPlanner(max_subqueries=self.max_subqueries)
-        self.synthesizer = AnswerSynthesizer(self.generator_module, max_context_tokens=self.max_context_tokens)
+        self.synthesizer = AnswerSynthesizer(
+            self.generator_module,
+            max_context_tokens=self.max_context_tokens,
+            query_prefix=self.query_prefix,
+        )
         self.verifier = (
             AnswerVerifier(
                 self.generator_module,

@@ -72,10 +72,15 @@ class AgentExecutor:
     def _draft_and_verify(self, state: AgentState, evidence_store: EvidenceStore) -> Tuple[Optional[str], bool]:
         """Synthesize an answer and (optionally) verify it.
 
+        Synthesis and verification always target ``original_query`` — the
+        immutable user question. Query rewrites only steer *retrieval* (via
+        ``current_query``); the answer and its verification must address what the
+        user actually asked, never a rewritten working query.
+
         Returns (answer, accepted).
         """
         answer, used_ids = self.synthesizer.generate(
-            state.current_query, evidence_store, compressed_context=state.compressed_context
+            state.original_query, evidence_store, compressed_context=state.compressed_context
         )
         evidence_store.mark_used(used_ids)
         state.draft_answer = answer
@@ -85,7 +90,7 @@ class AgentExecutor:
             state.record_action("draft_answer", observation_summary="drafted (unverified)")
             return answer, True
 
-        verification = self.verifier.verify(state.current_query, answer, evidence_store)
+        verification = self.verifier.verify(state.original_query, answer, evidence_store)
         state.set_verification(verification)
         accepted = self.policy.accept_verification(verification)
         state.record_action(

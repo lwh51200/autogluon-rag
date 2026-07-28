@@ -340,13 +340,16 @@ class EvaluationModule:
         self.save_evaluation_data = save_evaluation_data
         self.evaluation_dir = evaluation_dir
         self.save_csv_path = save_csv_path
-        self.max_eval_size = None
         self.metric_score_params = metric_score_params
         self.metric_init_params = metric_init_params
-        if max_eval_size >= self.dataset.num_rows:
+        # ``max_eval_size=None`` (the documented default) means "process the whole
+        # dataset". Only clamp when a concrete size was given that is >= the number
+        # of rows; otherwise honor the requested size.
+        if max_eval_size is not None and max_eval_size >= self.dataset.num_rows:
             logger.warning(
                 f"\nProvided `max_eval_size` ({max_eval_size}) >= Number of rows in the dataset ({self.dataset.num_rows}). Entire dataset will be processed for evaluation."
             )
+            self.max_eval_size = None
         else:
             self.max_eval_size = max_eval_size
         self.preprocessing_fn = preprocessing_fn
@@ -368,5 +371,10 @@ class EvaluationModule:
             predictions=generated_responses, references=expected_repsonses, queries=queries
         )
         if self.save_csv_path:
-            self.save_evaluation_results(output_csv=self.save_csv_path, references=expected_repsonses, queries=queries)
+            self.save_evaluation_results(
+                output_csv=self.save_csv_path,
+                predictions=generated_responses,
+                references=expected_repsonses,
+                queries=queries,
+            )
         return results

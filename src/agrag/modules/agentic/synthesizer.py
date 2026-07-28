@@ -25,11 +25,17 @@ class AnswerSynthesizer:
     max_context_tokens : int
         Approximate cap on context size. Evidence is included in order until the
         budget is reached (approximated by whitespace token count).
+    query_prefix : str
+        Optional instruction prepended to the query before formatting, mirroring
+        the standard RAG path (``AutoGluonRAG.generate_response``) so answer
+        formatting is consistent across standard and agentic modes. Applied only
+        to answer synthesis, not to verification or query-rewriting.
     """
 
-    def __init__(self, generator_module, max_context_tokens: int = 6000):
+    def __init__(self, generator_module, max_context_tokens: int = 6000, query_prefix: str = ""):
         self.generator_module = generator_module
         self.max_context_tokens = max_context_tokens
+        self.query_prefix = query_prefix or ""
 
     def _select_evidence(self, evidence_store: EvidenceStore) -> List[Evidence]:
         """Select evidence up to the (approximate) context-token budget."""
@@ -68,6 +74,10 @@ class AnswerSynthesizer:
             evidence_ids = [ev.evidence_id for ev in evidence_store if ev.evidence_id is not None]
         else:
             context_texts, evidence_ids = self.build_context(evidence_store)
+        # Prepend the configured query prefix (e.g. answer-format instructions),
+        # matching the standard path's behavior so both modes format answers alike.
+        if self.query_prefix:
+            query = f"{self.query_prefix}\n{query}"
         formatted = format_query(
             model_name=self.generator_module.model_name,
             query=query,

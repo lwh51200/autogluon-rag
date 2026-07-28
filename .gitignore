@@ -13,11 +13,16 @@ openai*
 *milvus_db
 *_data*
 
-# Local scratch area: demo, benchmark scripts, sample configs, generated
-# indexes/metadata/datasets. Kept on disk but not pushed.
-local_example/
+# Local example/benchmark area: KEEP the runnable sources, configs, and sample
+# docs tracked; ignore only the artifacts these scripts generate at runtime
+# (vector indexes/metadata, downloaded datasets/corpora, benchmark outputs).
+local_example/vector_db_index/
+local_example/vector_db_metadata/
+local_example/evaluation_data*/
+local_example/**/corpus/
 # Generated benchmark outputs
 benchmark_results.json
+local_example/**/benchmark_results.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
