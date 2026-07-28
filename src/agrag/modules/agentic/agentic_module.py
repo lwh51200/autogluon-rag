@@ -60,13 +60,20 @@ class AgenticRAGModule:
         self.min_evidence_count = cfg.get("min_evidence_count", 2)
         self.max_context_tokens = cfg.get("max_context_tokens", 6000)
         self.query_prefix = cfg.get("query_prefix", "")
+        self.use_fused_retrieval = cfg.get("use_fused_retrieval", False)
+        self.rrf_k = cfg.get("rrf_k", 60)
 
         self._build_components()
 
     def _build_components(self) -> None:
         tools = [
             RetrieveTool(self.retriever_module, top_k=self.retrieve_top_k_per_query),
-            MultiQueryRetrieveTool(self.retriever_module, top_k=self.retrieve_top_k_per_query),
+            MultiQueryRetrieveTool(
+                self.retriever_module,
+                top_k=self.retrieve_top_k_per_query,
+                use_fused_retrieval=self.use_fused_retrieval,
+                rrf_k=self.rrf_k,
+            ),
         ]
         if self.use_query_rewrite:
             tools.append(QueryRewriteTool(self.generator_module))

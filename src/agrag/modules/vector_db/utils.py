@@ -324,6 +324,55 @@ def load_metadata(
     return metadata
 
 
+def _parent_store_path(metadata_path: str) -> str:
+    """Derive the parent-store path that sits next to the metadata file."""
+    root, ext = os.path.splitext(metadata_path)
+    return f"{root}.parents{ext or '.jsonl'}"
+
+
+def save_parent_store(parent_store: pd.DataFrame, metadata_path: str) -> bool:
+    """Save the parent-chunk store next to the metadata file.
+
+    The parent store is optional (only present with parent-child chunking). It is
+    persisted in the same JSON-lines convention as metadata, at a sibling path
+    derived from ``metadata_path``. A None/empty store is a no-op.
+    """
+    if parent_store is None or parent_store.empty:
+        return False
+    parent_path = _parent_store_path(metadata_path)
+    parent_dir = os.path.dirname(parent_path)
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir)
+    try:
+        parent_store.to_json(parent_path, orient="records", lines=True)
+        logger.info(f"Parent store saved to {parent_path}")
+        return True
+    except (IOError, Exception) as e:
+        logger.error(f"Failed to save parent store to {parent_path}: {e}")
+        return False
+
+
+def load_parent_store(metadata_path: str) -> pd.DataFrame:
+    """Load the parent-chunk store that sits next to the metadata file.
+
+    Returns None when no parent store exists (e.g. an index built before
+    parent-child chunking, or with flat chunking), so older indexes still load.
+    """
+    if not metadata_path:
+        return None
+    parent_path = _parent_store_path(metadata_path)
+    if not os.path.isfile(parent_path):
+        logger.info(f"No parent store found at {parent_path}; skipping.")
+        return None
+    try:
+        parent_store = pd.read_json(parent_path, orient="records", lines=True)
+        logger.info(f"Parent store loaded from {parent_path}")
+        return parent_store
+    except (IOError, Exception) as e:
+        logger.error(f"Failed to load parent store from {parent_path}: {e}")
+        return None
+
+
 def save_index_s3(
     index_path: str,
     s3_bucket: str,

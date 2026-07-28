@@ -28,11 +28,51 @@ from typing import Dict, List
 # Minimal stopword set: dropping these keeps containment focused on the content
 # words that actually distinguish one fact from another.
 _STOPWORDS = {
-    "a", "an", "the", "and", "or", "but", "if", "of", "to", "in", "on", "for",
-    "with", "as", "by", "at", "from", "is", "are", "was", "were", "be", "been",
-    "it", "its", "this", "that", "these", "those", "he", "she", "they", "them",
-    "his", "her", "their", "has", "have", "had", "will", "would", "can", "could",
-    "s", "t",
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "but",
+    "if",
+    "of",
+    "to",
+    "in",
+    "on",
+    "for",
+    "with",
+    "as",
+    "by",
+    "at",
+    "from",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "he",
+    "she",
+    "they",
+    "them",
+    "his",
+    "her",
+    "their",
+    "has",
+    "have",
+    "had",
+    "will",
+    "would",
+    "can",
+    "could",
+    "s",
+    "t",
 }
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -81,6 +121,17 @@ def _evidence_coverage(retrieved_texts: List[str], gold_facts: List[str], thresh
     return covered / len(gold_facts)
 
 
+def _recall_at_k(retrieved_texts: List[str], gold_facts: List[str], k: int, threshold: float) -> float:
+    """Fraction of DISTINCT gold facts covered within the top-``k`` retrieved chunks.
+
+    This is ``_evidence_coverage`` restricted to a cutoff: unlike ``hit@k`` (which
+    is 1.0 as soon as *any* single gold fact appears), recall@k rewards covering
+    *more* of the required facts within the first ``k`` results -- the signal that
+    separates a multi-hop retriever from a single-shot one at a fixed budget.
+    """
+    return _evidence_coverage(retrieved_texts[:k], gold_facts, threshold)
+
+
 def retrieval_metrics_for_query(
     retrieved_texts: List[str],
     gold_facts: List[str],
@@ -104,7 +155,8 @@ def retrieval_metrics_for_query(
     -------
     Dict[str, float]
         ``hit@k`` for each k (1.0 if any gold fact appears in the top k, else 0),
-        ``mrr`` (reciprocal of the first hit's rank, 0 if none), and
+        ``recall@k`` for each k (fraction of distinct gold facts covered within
+        the top k), ``mrr`` (reciprocal of the first hit's rank, 0 if none), and
         ``evidence_coverage`` (fraction of distinct gold facts retrieved anywhere
         in the returned list).
     """
@@ -112,6 +164,7 @@ def retrieval_metrics_for_query(
     metrics: Dict[str, float] = {}
     for k in k_values:
         metrics[f"hit@{k}"] = 1.0 if (first_rank and first_rank <= k) else 0.0
+        metrics[f"recall@{k}"] = _recall_at_k(retrieved_texts, gold_facts, k, threshold)
     metrics["mrr"] = (1.0 / first_rank) if first_rank else 0.0
     metrics["evidence_coverage"] = _evidence_coverage(retrieved_texts, gold_facts, threshold)
     return metrics

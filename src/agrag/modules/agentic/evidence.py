@@ -43,6 +43,14 @@ class Evidence:
         Similarity score from the vector database, if exposed.
     rerank_score : Optional[float]
         Score from the reranker, if a reranker was used.
+    rrf_score : Optional[float]
+        Fused Reciprocal Rank Fusion score, when the evidence came from fused
+        (hybrid / multi-query) retrieval.
+    fusion_rank : Optional[int]
+        Position of this evidence in the fused ranking (0-indexed).
+    retrieval_queries : List[str]
+        Every query/subgoal that surfaced this chunk. Preserves full multi-query
+        provenance even after dedup (``retrieval_query`` holds the first).
     tool_name : Optional[str]
         Name of the tool that produced this evidence. Supports traceability.
     used_in_answer : bool
@@ -60,6 +68,9 @@ class Evidence:
     source: Optional[str] = None
     retrieval_score: Optional[float] = None
     rerank_score: Optional[float] = None
+    rrf_score: Optional[float] = None
+    fusion_rank: Optional[int] = None
+    retrieval_queries: List[str] = field(default_factory=list)
     tool_name: Optional[str] = None
     used_in_answer: bool = False
     evidence_id: Optional[str] = None
@@ -113,6 +124,9 @@ class Evidence:
             "source",
             "retrieval_score",
             "rerank_score",
+            "rrf_score",
+            "fusion_rank",
+            "retrieval_queries",
         }
         extra = {k: v for k, v in record.items() if k not in known}
         return cls(
@@ -124,6 +138,9 @@ class Evidence:
             source=record.get("source"),
             retrieval_score=record.get("retrieval_score"),
             rerank_score=record.get("rerank_score"),
+            rrf_score=record.get("rrf_score"),
+            fusion_rank=record.get("fusion_rank"),
+            retrieval_queries=list(record.get("retrieval_queries", [])),
             tool_name=tool_name,
             metadata=extra,
         )

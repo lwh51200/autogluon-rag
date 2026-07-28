@@ -16,7 +16,15 @@ from agrag.modules.generator.generator import GeneratorModule
 from agrag.modules.generator.utils import format_query
 from agrag.modules.retriever.rerankers.reranker import Reranker
 from agrag.modules.retriever.retrievers.retriever_base import RetrieverModule
-from agrag.modules.vector_db.utils import load_index, load_metadata, save_index, save_metadata
+from agrag.modules.retriever.retrievers.sparse_retriever import BM25Retriever
+from agrag.modules.vector_db.utils import (
+    load_index,
+    load_metadata,
+    load_parent_store,
+    save_index,
+    save_metadata,
+    save_parent_store,
+)
 from agrag.modules.vector_db.vector_database import VectorDatabaseModule
 from agrag.utils import get_num_gpus
 
@@ -145,6 +153,10 @@ class AutoGluonRAG:
         self.retriever_module = None
         self.generator_module = None
         self.agentic_module = None
+        # Parent-chunk store for parent-child (hierarchical) chunking; populated
+        # during data processing or when loading an existing index. None with
+        # legacy flat chunking.
+        self.parent_store = None
 
         self.batch_size = pipeline_batch_size or self.args.pipeline_batch_size
 
@@ -175,6 +187,8 @@ class AutoGluonRAG:
             web_urls=self.web_urls,
             chunk_size=self.args.chunk_size,
             chunk_overlap=self.args.chunk_overlap,
+            chunking_strategy=self.args.chunking_strategy,
+            children_per_parent=self.args.children_per_parent,
             file_exts=self.args.data_file_extns,
             html_tags_to_extract=self.args.html_tags_to_extract,
             login_info=self.login_info,
@@ -221,6 +235,11 @@ class AutoGluonRAG:
         """Initializes the Retriever module."""
         num_gpus = get_num_gpus(self.args.retriever_num_gpus)
         logger.info(f"Using number of GPUs: {num_gpus} for Retriever Module")
+        # Construct a BM25 sparse retriever only when hybrid retrieval is enabled;
+        # it builds its index lazily from the vector DB metadata on first use.
+        sparse_retriever = None
+        if self.args.use_hybrid:
+            sparse_retriever = BM25Retriever(k1=self.args.bm25_k1, b=self.args.bm25_b)
         self.retriever_module = RetrieverModule(
             vector_database_module=self.vector_db_module,
             embedding_module=self.embedding_module,
@@ -228,6 +247,16 @@ class AutoGluonRAG:
             reranker=self.reranker_module,
             num_gpus=num_gpus,
             use_reranker=self.args.use_reranker,
+            sparse_retriever=sparse_retriever,
+            use_hybrid=self.args.use_hybrid,
+            use_rrf=self.args.use_rrf,
+            rrf_k=self.args.rrf_k,
+            dense_weight=self.args.dense_weight,
+            sparse_weight=self.args.sparse_weight,
+            use_mmr=self.args.use_mmr,
+            mmr_lambda=self.args.mmr_lambda,
+            chunk_read=self.args.chunk_read,
+            parent_store=getattr(self, "parent_store", None),
         )
         logger.info("Retriever module initialized")
 
@@ -282,6 +311,9 @@ class AutoGluonRAG:
         """
         logger.info(f"Retrieving and Processing Data from {self.data_processing_module.data_dir}")
         processed_data = self.data_processing_module.process_data()
+        # Capture the parent store built during parent-child chunking (None with
+        # legacy flat chunking) so it can be attached to the retriever and saved.
+        self.parent_store = getattr(self.data_processing_module, "parent_store", None)
         return processed_data
 
     def generate_embeddings(self, processed_data: pd.DataFrame) -> pd.DataFrame:
@@ -357,6 +389,13 @@ class AutoGluonRAG:
         logger.info(f"Loading existing metadata from {metadata_path}")
         self.vector_db_module.metadata = load_metadata(metadata_path)
 
+        # Load the optional parent store (None for indexes built with flat
+        # chunking or before parent-child chunking existed).
+        self.parent_store = load_parent_store(metadata_path)
+        if self.retriever_module is not None:
+            self.retriever_module.parent_store = self.parent_store
+            self.retriever_module._parent_text_cache = None
+
         load_index_successful = (
             True if self.vector_db_module.index and self.vector_db_module.metadata is not None else False
         )
@@ -385,6 +424,10 @@ class AutoGluonRAG:
         save_index(self.vector_db_module.db_type, self.vector_db_module.index, index_path)
         logger.info(f"\nSaving Metadata at {metadata_path}")
         save_metadata(self.vector_db_module.metadata, metadata_path)
+        # Persist the parent store alongside metadata when parent-child chunking
+        # produced one (no-op otherwise).
+        if getattr(self, "parent_store", None) is not None:
+            save_parent_store(self.parent_store, metadata_path)
 
     def retrieve_context_for_query(self, query: str) -> List[Dict[str, Any]]:
         """
@@ -420,6 +463,8 @@ class AutoGluonRAG:
             "use_context_compression": self.args.agent_use_context_compression,
             "use_verification": self.args.agent_use_verification,
             "min_evidence_count": self.args.agent_min_evidence_count,
+            "use_fused_retrieval": self.args.agent_use_fused_retrieval,
+            "rrf_k": self.args.rrf_k,
             # Share the standard-path query prefix so answer formatting is
             # consistent across standard and agentic modes.
             "query_prefix": self.args.generator_query_prefix,

@@ -13,3 +13,8 @@ AGENT_USE_CONTEXT_COMPRESSION: false
 AGENT_USE_VERIFICATION: true
 AGENT_MIN_EVIDENCE_COUNT: 2
 AGENT_RETURN_TRACE: false
+# When true, MultiQueryRetrieveTool fuses per-subquery results with RRF + one
+# global cross-encoder rerank instead of simply concatenating them. Off by
+# default so the standard agentic behavior (and its evidence counts) is
+# unchanged.
+AGENT_USE_FUSED_RETRIEVAL: false

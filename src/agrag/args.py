@@ -195,6 +195,22 @@ class Arguments:
         self.config["data"]["chunk_overlap"] = value
 
     @property
+    def chunking_strategy(self):
+        return self.config.get("data", {}).get("chunking_strategy", self.data_defaults.get("CHUNKING_STRATEGY"))
+
+    @chunking_strategy.setter
+    def chunking_strategy(self, value):
+        self.config.setdefault("data", {})["chunking_strategy"] = value
+
+    @property
+    def children_per_parent(self):
+        return self.config.get("data", {}).get("children_per_parent", self.data_defaults.get("CHILDREN_PER_PARENT"))
+
+    @children_per_parent.setter
+    def children_per_parent(self, value):
+        self.config.setdefault("data", {})["children_per_parent"] = value
+
+    @property
     def data_file_extns(self):
         return self.config.get("data", {}).get("file_extns", self.data_defaults.get("SUPPORTED_FILE_EXTENSIONS"))
 
@@ -557,6 +573,86 @@ class Arguments:
         self.config["retriever"]["num_gpus"] = value
 
     @property
+    def use_hybrid(self):
+        return self.config.get("retriever", {}).get("use_hybrid", self.retriever_defaults.get("USE_HYBRID"))
+
+    @use_hybrid.setter
+    def use_hybrid(self, value):
+        self.config.setdefault("retriever", {})["use_hybrid"] = value
+
+    @property
+    def use_rrf(self):
+        return self.config.get("retriever", {}).get("use_rrf", self.retriever_defaults.get("USE_RRF"))
+
+    @use_rrf.setter
+    def use_rrf(self, value):
+        self.config.setdefault("retriever", {})["use_rrf"] = value
+
+    @property
+    def rrf_k(self):
+        return self.config.get("retriever", {}).get("rrf_k", self.retriever_defaults.get("RRF_K"))
+
+    @rrf_k.setter
+    def rrf_k(self, value):
+        self.config.setdefault("retriever", {})["rrf_k"] = value
+
+    @property
+    def dense_weight(self):
+        return self.config.get("retriever", {}).get("dense_weight", self.retriever_defaults.get("DENSE_WEIGHT"))
+
+    @dense_weight.setter
+    def dense_weight(self, value):
+        self.config.setdefault("retriever", {})["dense_weight"] = value
+
+    @property
+    def sparse_weight(self):
+        return self.config.get("retriever", {}).get("sparse_weight", self.retriever_defaults.get("SPARSE_WEIGHT"))
+
+    @sparse_weight.setter
+    def sparse_weight(self, value):
+        self.config.setdefault("retriever", {})["sparse_weight"] = value
+
+    @property
+    def use_mmr(self):
+        return self.config.get("retriever", {}).get("use_mmr", self.retriever_defaults.get("USE_MMR"))
+
+    @use_mmr.setter
+    def use_mmr(self, value):
+        self.config.setdefault("retriever", {})["use_mmr"] = value
+
+    @property
+    def mmr_lambda(self):
+        return self.config.get("retriever", {}).get("mmr_lambda", self.retriever_defaults.get("MMR_LAMBDA"))
+
+    @mmr_lambda.setter
+    def mmr_lambda(self, value):
+        self.config.setdefault("retriever", {})["mmr_lambda"] = value
+
+    @property
+    def chunk_read(self):
+        return self.config.get("retriever", {}).get("chunk_read", self.retriever_defaults.get("CHUNK_READ"))
+
+    @chunk_read.setter
+    def chunk_read(self, value):
+        self.config.setdefault("retriever", {})["chunk_read"] = value
+
+    @property
+    def bm25_k1(self):
+        return self.config.get("retriever", {}).get("bm25_k1", self.retriever_defaults.get("BM25_K1"))
+
+    @bm25_k1.setter
+    def bm25_k1(self, value):
+        self.config.setdefault("retriever", {})["bm25_k1"] = value
+
+    @property
+    def bm25_b(self):
+        return self.config.get("retriever", {}).get("bm25_b", self.retriever_defaults.get("BM25_B"))
+
+    @bm25_b.setter
+    def bm25_b(self, value):
+        self.config.setdefault("retriever", {})["bm25_b"] = value
+
+    @property
     def generator_model_name(self):
         return self.config.get("generator", {}).get(
             "generator_model_name", self.generator_defaults.get("GENERATOR_MODEL")
@@ -700,3 +796,13 @@ class Arguments:
     @agent_return_trace.setter
     def agent_return_trace(self, value):
         self.config.setdefault("agent", {})["return_trace"] = value
+
+    @property
+    def agent_use_fused_retrieval(self):
+        return self.config.get("agent", {}).get(
+            "use_fused_retrieval", self.agent_defaults.get("AGENT_USE_FUSED_RETRIEVAL")
+        )
+
+    @agent_use_fused_retrieval.setter
+    def agent_use_fused_retrieval(self, value):
+        self.config.setdefault("agent", {})["use_fused_retrieval"] = value
