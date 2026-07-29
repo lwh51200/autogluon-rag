@@ -6,6 +6,11 @@ data:
   chunk_overlap: 16
   file_extns:
     - "txt"
+  # Small-to-big retrieval: build a parent store so a matched child chunk can be
+  # expanded to its parent context. Requires ingest (use_existing_vector_db is
+  # false below, so the corpus is re-ingested and the parent store is built).
+  chunking_strategy: parent_child
+  children_per_parent: 4
 
 embedding:
   # Small HuggingFace embedding model that runs on CPU
@@ -36,12 +41,37 @@ vector_db:
 
 retriever:
   retriever_top_k: 5
-  use_reranker: false   # skip reranker to keep it fast/light on CPU
-  reranker_top_k: 3
-  reranker_model_name: BAAI/bge-large-en
+  # Cross-encoder reranker ON. The rerank stage of both hybrid retrieve() and the
+  # agentic retrieve_fused() is gated on a live reranker; without it that stage
+  # silently no-ops. bge-reranker-base is a real cross-encoder (relevance head)
+  # and lighter than -large for CPU. NOTE: bge-large-en is an EMBEDDING model with
+  # no reranker head and must not be used here.
+  use_reranker: true
+  reranker_top_k: 5
+  reranker_model_name: BAAI/bge-reranker-base
   reranker_model_platform: huggingface
   reranker_batch_size: 8
   num_gpus: 0
+  # Hybrid + hierarchical retrieval (all default OFF in the framework).
+  # use_hybrid adds a BM25 sparse signal fused with dense via RRF.
+  use_hybrid: true
+  use_rrf: true
+  rrf_k: 60
+  dense_weight: 1.0
+  sparse_weight: 1.0
+  # MMR diversity pass after reranking (helps multi-hop pull from distinct docs).
+  use_mmr: true
+  mmr_lambda: 0.5
+  # Neighbor-window expansion (+/- N adjacent chunks) on top of parent expansion.
+  chunk_read: 1
+
+agent:
+  # Global fused multi-query retrieval for the agentic path: instead of
+  # concatenating per-subquery results, MultiQueryRetrieveTool runs one global
+  # pipeline (raw candidates -> single RRF -> one cross-encoder rerank against the
+  # original query -> one MMR -> top-k -> parent/neighbor expansion). Reuses the
+  # retriever's rrf_k / weights / use_mmr / chunk_read / parent store above.
+  use_fused_retrieval: true
 
 generator:
   # Real generator via AWS Bedrock (Claude Haiku 4.5) for meaningful answers.
