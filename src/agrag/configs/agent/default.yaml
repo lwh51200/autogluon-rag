@@ -13,8 +13,15 @@ AGENT_USE_CONTEXT_COMPRESSION: false
 AGENT_USE_VERIFICATION: true
 AGENT_MIN_EVIDENCE_COUNT: 2
 AGENT_RETURN_TRACE: false
-# When true, MultiQueryRetrieveTool fuses per-subquery results with RRF + one
-# global cross-encoder rerank instead of simply concatenating them. Off by
-# default so the standard agentic behavior (and its evidence counts) is
+# When true, MultiQueryRetrieveTool runs one genuinely global multi-query
+# pipeline instead of concatenating per-subquery results: it collects raw dense
+# (and, when retriever.USE_HYBRID is on, sparse) candidates for every subquery
+# with no per-query reranking/MMR/expansion/truncation, runs a single RRF across
+# all (subquery x signal) ranked lists, dedups by chunk identity while preserving
+# every retrieval_query and source_signal, runs the cross-encoder exactly once
+# against the original user query, applies MMR once (when retriever.USE_MMR),
+# selects the final top-k, and only then expands parent/neighbor context. It
+# reuses RRF_K and the fusion/MMR/expansion settings from the retriever config.
+# Off by default so the standard agentic behavior (and its evidence counts) is
 # unchanged.
 AGENT_USE_FUSED_RETRIEVAL: false

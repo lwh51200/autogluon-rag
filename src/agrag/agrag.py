@@ -316,6 +316,20 @@ class AutoGluonRAG:
         self.parent_store = getattr(self.data_processing_module, "parent_store", None)
         return processed_data
 
+    def _attach_parent_store_to_retriever(self):
+        """Wire the freshly built parent store into the retriever.
+
+        The retriever is initialized before data processing runs, so it starts
+        with ``parent_store=None``. After processing (batched or not) populates
+        ``self.parent_store``, this attaches it and resets the retriever's parent
+        text cache so parent expansion works on the very first query. A None store
+        (legacy flat chunking) leaves the retriever's dense-only path unchanged.
+        """
+        if getattr(self, "retriever_module", None) is None:
+            return
+        self.retriever_module.parent_store = self.parent_store
+        self.retriever_module._parent_text_cache = None
+
     def generate_embeddings(self, processed_data: pd.DataFrame) -> pd.DataFrame:
         """
         Generates embeddings from the processed data using the initialized Embedding module.
@@ -503,28 +517,42 @@ class AutoGluonRAG:
             ``agent.default_mode`` config value, or "agentic" when ``agent.enabled``
             is set.
         return_trace : bool, optional
-            Agentic mode only. When True, returns ``(answer, trace)`` where trace
-            is a serializable dict describing the run. Defaults to the
-            ``agent.return_trace`` config value.
+            When True, returns ``(answer, trace)`` where ``trace`` is a
+            serializable dict describing the run. Supported in both modes: the
+            agentic trace describes the full agent loop; the standard trace
+            carries the exact structured evidence the generator conditioned on
+            plus simple retrieval metrics. When None/False the return value is the
+            answer string only (unchanged default behavior). In agentic mode a
+            None default falls back to the ``agent.return_trace`` config value.
 
         Returns:
         -------
         str or Tuple[str, dict]
-            The generated response, or ``(response, trace)`` in agentic mode with
+            The generated response, or ``(response, trace)`` when
             ``return_trace=True``.
 
         Example:
         --------
         response = agrag.generate_response("What is AutoGluon?")
+        answer, trace = agrag.generate_response("What is AutoGluon?", mode="standard", return_trace=True)
         response = agrag.generate_response("How should this repo support agents?", mode="agentic")
         """
         resolved_mode = self._resolve_mode(mode)
         if resolved_mode == "agentic":
             return self._generate_response_agentic(query, return_trace=return_trace)
 
+        # Standard path: retrieve exactly once. When a trace is requested we pull
+        # structured records (so the trace can carry the exact evidence used);
+        # otherwise we keep the original text-only retrieval byte-for-byte.
+        original_query = query
+        records = None
         retrieved_context = ""
         if self.retriever_module.top_k > 0:
-            retrieved_context = self.retrieve_context_for_query(query)
+            if return_trace:
+                records = self.retriever_module.retrieve(query, return_metadata=True)
+                retrieved_context = [self._record_text(rec) for rec in records] if records else ""
+            else:
+                retrieved_context = self.retrieve_context_for_query(query)
 
         query_prefix = self.args.generator_query_prefix
         if query_prefix:
@@ -537,7 +565,44 @@ class AutoGluonRAG:
 
         logger.info(f"\nResponse: {response}\n")
 
+        if return_trace:
+            return response, self._standard_trace(original_query, records, response)
         return response
+
+    @staticmethod
+    def _record_text(record: Any) -> str:
+        """Extract chunk text from a retriever record (dict) or raw string."""
+        if isinstance(record, dict):
+            return record.get("text", "")
+        return str(record)
+
+    def _standard_trace(self, query: str, records, answer: str) -> Dict[str, Any]:
+        """Build a serializable trace for a standard-RAG run.
+
+        The trace records the exact structured evidence the generator conditioned
+        on (the retriever records, best-first) plus lightweight retrieval metrics.
+        It mirrors the agentic trace's ``original_query``/``final_answer``/
+        ``evidence``/``metrics`` keys so downstream consumers (e.g. the benchmark)
+        can treat both modes uniformly. Standard RAG performs a single retrieval,
+        so ``retrieval_calls`` is 1 when retrieval ran and 0 when ``top_k`` is 0.
+        """
+        evidence: List[Dict[str, Any]] = []
+        if records:
+            for rank, record in enumerate(records):
+                if isinstance(record, dict):
+                    evidence.append(dict(record))
+                else:
+                    evidence.append({"text": str(record), "rank": rank})
+        return {
+            "mode": "standard",
+            "original_query": query,
+            "final_answer": answer,
+            "evidence": evidence,
+            "metrics": {
+                "retrieval_calls": 1 if self.retriever_module.top_k > 0 else 0,
+                "evidence_count": len(evidence),
+            },
+        }
 
     def _resolve_mode(self, mode: str = None) -> str:
         """Resolve the answering mode from the explicit arg then config.
@@ -612,6 +677,14 @@ class AutoGluonRAG:
             start_doc_id = last_doc_id
             processed_data = pd.concat([processed_files_data, processed_urls_data]).reset_index(drop=True)
 
+            # Parent-child chunking: group this batch's children into parents. The
+            # data module keeps a running parent_id counter and appends to its
+            # parent store, so IDs stay globally unique and the store accumulates
+            # across batches. No-op for legacy flat chunking.
+            if self.data_processing_module.chunking_strategy == "parent_child" and not processed_data.empty:
+                processed_data = self.data_processing_module.build_parent_child(processed_data)
+                self.parent_store = self.data_processing_module.parent_store
+
             # Embedding
             embeddings = self.generate_embeddings(processed_data)
 
@@ -667,6 +740,10 @@ class AutoGluonRAG:
                     f"\nUsing batch size of {self.batch_size}. You can change this value by setting pipeline_batch_size in the config file or when initializing AutoGluon RAG."
                 )
                 self.batched_processing()
+
+            # Attach the parent store (if parent-child chunking produced one) to
+            # the retriever, which was initialized before data was processed.
+            self._attach_parent_store_to_retriever()
 
             if self.args.save_vector_db_index:
                 self.save_index_and_metadata(self.args.vector_db_index_save_path, self.args.metadata_index_save_path)

@@ -6,12 +6,11 @@ convert the structured records into ``Evidence`` objects.
 """
 
 import logging
-from typing import Dict, List
+from typing import List
 
-from agrag.constants import CHUNK_ID_KEY, DOC_ID_KEY, DOC_TEXT_KEY, LOGGER_NAME
+from agrag.constants import LOGGER_NAME
 from agrag.modules.agentic.evidence import Evidence
 from agrag.modules.agentic.tools.base import Tool, ToolResult
-from agrag.modules.retriever.fusion import dedup_records, reciprocal_rank_fusion
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -85,9 +84,9 @@ class MultiQueryRetrieveTool(Tool):
         self.use_fused_retrieval = use_fused_retrieval
         self.rrf_k = rrf_k
 
-    def run(self, queries: List[str], **kwargs) -> ToolResult:
+    def run(self, queries: List[str], original_query: str = None, **kwargs) -> ToolResult:
         if self.use_fused_retrieval:
-            return self._run_fused(queries)
+            return self._run_fused(queries, original_query)
 
         all_evidence: List[Evidence] = []
         for query in queries:
@@ -99,78 +98,44 @@ class MultiQueryRetrieveTool(Tool):
             summary=f"retrieved {len(all_evidence)} chunks across {len(queries)} subqueries",
         )
 
-    def _dedup_key(self, record: Dict) -> object:
-        doc_id = record.get(DOC_ID_KEY)
-        chunk_id = record.get(CHUNK_ID_KEY)
-        if doc_id is not None and chunk_id is not None:
-            return (doc_id, chunk_id)
-        return ("text", record.get(DOC_TEXT_KEY, ""))
+    def _run_fused(self, queries: List[str], original_query: str = None) -> ToolResult:
+        """Globally fuse retrieval across all subqueries via the retriever.
 
-    def _run_fused(self, queries: List[str]) -> ToolResult:
-        """Fuse per-subquery results globally with RRF instead of concatenating.
-
-        Each subquery's records form one ranked list; the lists are fused with
-        RRF over ``(doc_id, chunk_id)`` identity, deduped while preserving every
-        subquery that surfaced a chunk, then reranked once globally by the
-        retriever's cross-encoder (when present). This gives one globally-ordered
-        evidence set whose provenance still spans all subgoals.
+        Delegates to ``RetrieverModule.retrieve_fused``, which owns the genuinely
+        global pipeline: raw per-``(subquery x signal)`` candidates, one RRF, one
+        provenance-preserving dedup, one cross-encoder rerank against the original
+        user query, one MMR pass, final top-k, then context expansion. This tool
+        only turns the resulting records into ``Evidence`` — it performs no
+        fusion or reranking of its own, so nothing is reranked twice.
         """
-        per_query_records: List[List[Dict]] = []
-        all_records: List[Dict] = []
-        for query in queries:
-            records = self.retriever_module.retrieve(query, return_metadata=True, top_k=self.top_k) or []
-            tagged = []
-            for record in records:
-                item = dict(record)
-                item["retrieval_query"] = query
-                item["signal"] = query
-                tagged.append(item)
-            per_query_records.append(tagged)
-            all_records.extend(tagged)
+        retrieve_fused = getattr(self.retriever_module, "retrieve_fused", None)
+        if retrieve_fused is None:
+            # Retriever predates global fusion; fall back to plain concatenation
+            # so the tool still works rather than raising.
+            logger.debug("%s: retriever has no retrieve_fused; falling back to concat", self.name)
+            return self.__class__(self.retriever_module, top_k=self.top_k).run(queries=queries)
 
-        if not all_records:
+        records = (
+            retrieve_fused(
+                subqueries=queries,
+                original_query=original_query if original_query is not None else (queries[0] if queries else None),
+                return_metadata=True,
+                top_k=self.top_k,
+                rrf_k=self.rrf_k,
+            )
+            or []
+        )
+
+        if not records:
             return self._result(evidence=[], summary=f"retrieved 0 chunks across {len(queries)} subqueries (fused)")
 
-        # Dedup while preserving all subquery provenance, keyed by chunk identity.
-        deduped = dedup_records(all_records, key_fn=self._dedup_key)
-        by_key = {self._dedup_key(r): r for r in deduped}
-
-        # RRF fuse the per-subquery ranked lists on chunk identity.
-        ranked_lists = [[self._dedup_key(r) for r in recs] for recs in per_query_records]
-        fused = reciprocal_rank_fusion(ranked_lists, k=self.rrf_k)
-
-        ordered: List[Dict] = []
-        for fusion_rank, (key, rrf_score) in enumerate(fused):
-            record = by_key.get(key)
-            if record is None:
-                continue
-            record["rrf_score"] = rrf_score
-            record["fusion_rank"] = fusion_rank
-            ordered.append(record)
-
-        # One global cross-encoder rerank over the fused pool, when available.
-        reranker = getattr(self.retriever_module, "reranker", None)
-        if reranker is not None and ordered:
-            texts = [r.get(DOC_TEXT_KEY, "") for r in ordered]
-            reranked = reranker.rerank(queries[0], texts, return_scores=True)
-            text_to_records: Dict[str, List[Dict]] = {}
-            for record in ordered:
-                text_to_records.setdefault(record.get(DOC_TEXT_KEY, ""), []).append(record)
-            reranked_order = []
-            for text, rerank_score in reranked:
-                bucket = text_to_records.get(text)
-                if not bucket:
-                    continue
-                record = bucket.pop(0)
-                record["rerank_score"] = rerank_score
-                reranked_order.append(record)
-            if reranked_order:
-                ordered = reranked_order
-
         evidence: List[Evidence] = []
-        for rank, record in enumerate(ordered):
-            primary_query = record.get("retrieval_query", queries[0])
-            record["retrieval_queries"] = record.get("source_signals", []) or record.get("retrieval_queries", [])
+        for rank, record in enumerate(records):
+            # ``retrieval_queries`` already holds every subquery that surfaced the
+            # chunk (from the retriever's provenance-preserving dedup); the first
+            # is used as the representative retrieval_query.
+            queries_for_record = record.get("retrieval_queries") or []
+            primary_query = queries_for_record[0] if queries_for_record else (queries[0] if queries else "")
             item = Evidence.from_retrieval_record(
                 record, retrieval_query=primary_query, rank=rank, tool_name=self.name
             )

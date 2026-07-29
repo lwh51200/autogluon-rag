@@ -336,20 +336,44 @@ def save_parent_store(parent_store: pd.DataFrame, metadata_path: str) -> bool:
     The parent store is optional (only present with parent-child chunking). It is
     persisted in the same JSON-lines convention as metadata, at a sibling path
     derived from ``metadata_path``. A None/empty store is a no-op.
+
+    S3 paths follow the same ``parse_path``/boto3 convention as ``save_metadata``:
+    the store is written locally to the parsed (bucket-relative) path and then
+    uploaded, so an ``s3://`` path never creates a literal local ``s3:`` directory.
     """
     if parent_store is None or parent_store.empty:
         return False
+    # Derive the sibling parent path from the raw (possibly s3://) metadata path,
+    # then parse it, mirroring save_metadata so S3 vs local behave consistently.
     parent_path = _parent_store_path(metadata_path)
+    s3_bucket, parent_path = parse_path(parent_path)
+    s3_client = boto3.client("s3") if s3_bucket else None
+
     parent_dir = os.path.dirname(parent_path)
     if parent_dir and not os.path.exists(parent_dir):
         os.makedirs(parent_dir)
     try:
         parent_store.to_json(parent_path, orient="records", lines=True)
         logger.info(f"Parent store saved to {parent_path}")
-        return True
     except (IOError, Exception) as e:
         logger.error(f"Failed to save parent store to {parent_path}: {e}")
         return False
+
+    if s3_bucket:
+        try:
+            s3_client.upload_file(Filename=parent_path, Bucket=s3_bucket, Key=parent_path)
+            logger.info(f"Parent store saved to S3 Bucket {s3_bucket} at {parent_path}.")
+            return True
+        except (NoCredentialsError, PartialCredentialsError):
+            logger.error("AWS credentials not found or incomplete.")
+            return False
+        except ClientError as e:
+            logger.error(f"Failed to upload parent store to S3: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while saving parent store to S3: {e}")
+            return False
+    return True
 
 
 def load_parent_store(metadata_path: str) -> pd.DataFrame:
@@ -357,13 +381,35 @@ def load_parent_store(metadata_path: str) -> pd.DataFrame:
 
     Returns None when no parent store exists (e.g. an index built before
     parent-child chunking, or with flat chunking), so older indexes still load.
+
+    S3 paths follow the same ``parse_path``/boto3 convention as ``load_metadata``:
+    the store is downloaded to the parsed (bucket-relative) path before reading,
+    so an ``s3://`` path never creates a literal local ``s3:`` directory.
     """
     if not metadata_path:
         return None
     parent_path = _parent_store_path(metadata_path)
-    if not os.path.isfile(parent_path):
+    s3_bucket, parent_path = parse_path(parent_path)
+    s3_client = boto3.client("s3") if s3_bucket else None
+
+    if s3_bucket:
+        try:
+            s3_client.download_file(Filename=parent_path, Bucket=s3_bucket, Key=parent_path)
+            logger.info(f"Parent store loaded from S3 Bucket {s3_bucket} at {parent_path}.")
+        except (NoCredentialsError, PartialCredentialsError):
+            logger.error("AWS credentials not found or incomplete.")
+            return None
+        except ClientError as e:
+            # A missing object is expected for indexes without a parent store.
+            logger.info(f"No parent store in S3 ({e}); skipping.")
+            return None
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while loading parent store from S3: {e}")
+            return None
+    elif not os.path.isfile(parent_path):
         logger.info(f"No parent store found at {parent_path}; skipping.")
         return None
+
     try:
         parent_store = pd.read_json(parent_path, orient="records", lines=True)
         logger.info(f"Parent store loaded from {parent_path}")

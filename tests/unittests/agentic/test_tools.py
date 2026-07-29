@@ -99,70 +99,103 @@ class TestMultiQueryRetrieveTool(unittest.TestCase):
         self.assertEqual(stored, 1)  # store keeps one
 
 
-class TestMultiQueryRetrieveToolFused(unittest.TestCase):
-    def test_fused_mode_dedups_and_preserves_provenance(self):
-        # Chunk (0,0) surfaced by both subqueries; (0,1) and (1,0) each by one.
-        retriever = FakeRetriever(
+class FakeFusedRetriever:
+    """Retriever exposing ``retrieve_fused``; records how it was called.
+
+    Fusion/rerank/MMR correctness lives in the retriever's own unit tests
+    (test_hybrid_retriever.py). Here we only assert the tool delegates to
+    ``retrieve_fused`` once and converts the returned records into Evidence,
+    preserving provenance — the tool itself does no fusion or reranking.
+    """
+
+    def __init__(self, fused_records):
+        self.fused_records = fused_records
+        self.fused_calls = []
+        self.retrieve_calls = []
+
+    def retrieve_fused(self, subqueries, original_query=None, return_metadata=False, top_k=None, rrf_k=None):
+        self.fused_calls.append(
             {
-                "q1": [
-                    {"text": "a", "doc_id": 0, "chunk_id": 0},
-                    {"text": "b", "doc_id": 0, "chunk_id": 1},
-                ],
-                "q2": [
-                    {"text": "a", "doc_id": 0, "chunk_id": 0},
-                    {"text": "c", "doc_id": 1, "chunk_id": 0},
-                ],
+                "subqueries": subqueries,
+                "original_query": original_query,
+                "return_metadata": return_metadata,
+                "top_k": top_k,
+                "rrf_k": rrf_k,
             }
         )
-        tool = MultiQueryRetrieveTool(retriever, use_fused_retrieval=True)
-        result = tool.run(queries=["q1", "q2"])
+        return list(self.fused_records) if self.fused_records is not None else None
 
-        # Fused: one record per distinct chunk, not concatenated (would be 4).
-        self.assertEqual(len(result.evidence), 3)
-        by_text = {e.text: e for e in result.evidence}
-        # The shared chunk keeps BOTH subqueries as provenance.
-        self.assertEqual(by_text["a"].retrieval_queries, ["q1", "q2"])
-        # Single-subquery chunks keep just their own.
-        self.assertEqual(by_text["b"].retrieval_queries, ["q1"])
-        self.assertEqual(by_text["c"].retrieval_queries, ["q2"])
+    def retrieve(self, query, return_metadata=False, top_k=None):
+        self.retrieve_calls.append((query, return_metadata, top_k))
+        return None
 
-    def test_fused_mode_assigns_fusion_rank_and_rrf_score(self):
-        retriever = FakeRetriever(
-            {
-                "q1": [{"text": "a", "doc_id": 0, "chunk_id": 0}],
-                "q2": [{"text": "a", "doc_id": 0, "chunk_id": 0}],
-            }
+
+class TestMultiQueryRetrieveToolFused(unittest.TestCase):
+    def test_fused_mode_delegates_once_to_retriever(self):
+        retriever = FakeFusedRetriever([{"text": "a", "doc_id": 0, "chunk_id": 0, "retrieval_queries": ["q1", "q2"]}])
+        tool = MultiQueryRetrieveTool(retriever, top_k=7, use_fused_retrieval=True, rrf_k=42)
+        tool.run(queries=["q1", "q2"], original_query="user question")
+
+        # Exactly one global fused call; no per-subquery retrieve() calls (which
+        # would be the double-processing / concatenation path).
+        self.assertEqual(len(retriever.fused_calls), 1)
+        self.assertEqual(retriever.retrieve_calls, [])
+        call = retriever.fused_calls[0]
+        self.assertEqual(call["subqueries"], ["q1", "q2"])
+        self.assertEqual(call["original_query"], "user question")
+        self.assertEqual(call["top_k"], 7)
+        self.assertEqual(call["rrf_k"], 42)
+        self.assertTrue(call["return_metadata"])
+
+    def test_fused_mode_preserves_provenance_from_records(self):
+        retriever = FakeFusedRetriever(
+            [
+                {
+                    "text": "a",
+                    "doc_id": 0,
+                    "chunk_id": 0,
+                    "rrf_score": 0.5,
+                    "fusion_rank": 0,
+                    "rerank_score": 9.0,
+                    "retrieval_queries": ["q1", "q2"],
+                    "source_signals": ["dense", "sparse"],
+                },
+                {"text": "b", "doc_id": 0, "chunk_id": 1, "retrieval_queries": ["q2"]},
+            ]
         )
         result = MultiQueryRetrieveTool(retriever, use_fused_retrieval=True).run(queries=["q1", "q2"])
-        top = result.evidence[0]
-        self.assertEqual(top.fusion_rank, 0)
-        self.assertIsNotNone(top.rrf_score)
-        self.assertGreater(top.rrf_score, 0.0)
+        by_text = {e.text: e for e in result.evidence}
+        # All retrieval_queries survive onto the Evidence; representative query is
+        # the first of the merged provenance.
+        self.assertEqual(by_text["a"].retrieval_queries, ["q1", "q2"])
+        self.assertEqual(by_text["a"].retrieval_query, "q1")
+        self.assertEqual(by_text["b"].retrieval_queries, ["q2"])
+        # source_signals is carried through as extra metadata.
+        self.assertEqual(by_text["a"].metadata.get("source_signals"), ["dense", "sparse"])
+        # Fusion + rerank scores threaded onto Evidence.
+        self.assertEqual(by_text["a"].fusion_rank, 0)
+        self.assertEqual(by_text["a"].rrf_score, 0.5)
+        self.assertEqual(by_text["a"].rerank_score, 9.0)
+        # Tool-assigned rank follows the retriever's global order.
+        self.assertEqual([e.rank for e in result.evidence], [0, 1])
 
     def test_fused_mode_empty_results(self):
-        retriever = FakeRetriever({"q1": None, "q2": None})
+        retriever = FakeFusedRetriever(None)
         result = MultiQueryRetrieveTool(retriever, use_fused_retrieval=True).run(queries=["q1", "q2"])
         self.assertFalse(result.contains_evidence)
         self.assertEqual(len(result.evidence), 0)
 
-    def test_fused_mode_applies_global_reranker(self):
-        class FakeReranker:
-            def rerank(self, query, texts, return_scores=False):
-                # Reverse order, attach descending scores.
-                reversed_texts = list(reversed(texts))
-                return [(t, float(len(reversed_texts) - i)) for i, t in enumerate(reversed_texts)]
-
+    def test_fused_mode_falls_back_when_retriever_lacks_method(self):
+        # An older retriever without retrieve_fused must not crash; the tool falls
+        # back to plain concatenation.
         retriever = FakeRetriever(
             {
                 "q1": [{"text": "a", "doc_id": 0, "chunk_id": 0}],
-                "q2": [{"text": "c", "doc_id": 1, "chunk_id": 0}],
-            },
-            reranker=FakeReranker(),
+                "q2": [{"text": "b", "doc_id": 0, "chunk_id": 1}],
+            }
         )
         result = MultiQueryRetrieveTool(retriever, use_fused_retrieval=True).run(queries=["q1", "q2"])
-        # The reranker reversed fused order; evidence follows the rerank.
-        self.assertEqual([e.text for e in result.evidence][0], "c")
-        self.assertIsNotNone(result.evidence[0].rerank_score)
+        self.assertEqual(len(result.evidence), 2)
 
 
 class TestLLMTools(unittest.TestCase):

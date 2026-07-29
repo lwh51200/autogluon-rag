@@ -164,7 +164,14 @@ class AgentExecutor:
                 result = self.tool_registry.run("RetrieveTool", query=action.args["query"])
                 tool_name = "RetrieveTool"
             elif action.type == ActionType.MULTI_RETRIEVE:
-                result = self.tool_registry.run("MultiQueryRetrieveTool", queries=action.args["queries"])
+                # Pass the immutable user question so the fused path's single
+                # global cross-encoder rerank scores candidates against what the
+                # user actually asked, not against any one subquery.
+                result = self.tool_registry.run(
+                    "MultiQueryRetrieveTool",
+                    queries=action.args["queries"],
+                    original_query=state.original_query,
+                )
                 tool_name = "MultiQueryRetrieveTool"
             else:
                 raise ValueError(f"Unhandled action type: {action.type}")

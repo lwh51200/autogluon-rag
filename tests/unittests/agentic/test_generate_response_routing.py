@@ -73,6 +73,50 @@ class TestGenerateResponseRouting(unittest.TestCase):
         self.assertIsInstance(trace, dict)
         self.assertIn("metrics", trace)
 
+    def test_standard_return_trace_single_retrieval_and_evidence_consistency(self):
+        agrag = self._build_agrag()
+        # Structured records the standard trace must carry verbatim as evidence.
+        records = [
+            {"text": "alpha", "doc_id": 0, "chunk_id": 0, "rank": 0, "retrieval_score": 0.9},
+            {"text": "beta", "doc_id": 1, "chunk_id": 0, "rank": 1, "retrieval_score": 0.8},
+        ]
+        agrag.retriever_module.retrieve.return_value = records
+        agrag.generator_module.generate_response.return_value = "standard answer"
+
+        result = agrag.generate_response("what is autogluon", mode="standard", return_trace=True)
+
+        # Returns (answer, trace); default (no return_trace) still returns a str.
+        self.assertIsInstance(result, tuple)
+        answer, trace = result
+        self.assertEqual(answer, "standard answer")
+        # Exactly ONE retrieval for the whole standard run.
+        agrag.retriever_module.retrieve.assert_called_once()
+        # Trace mirrors the agentic schema and carries the exact evidence used.
+        self.assertEqual(trace["mode"], "standard")
+        self.assertEqual(trace["final_answer"], "standard answer")
+        self.assertEqual([e["text"] for e in trace["evidence"]], ["alpha", "beta"])
+        self.assertEqual(trace["evidence"][0]["retrieval_score"], 0.9)
+        self.assertEqual(trace["metrics"]["retrieval_calls"], 1)
+        self.assertEqual(trace["metrics"]["evidence_count"], 2)
+        # original_query is the raw query, not the prefixed generator query.
+        self.assertEqual(trace["original_query"], "what is autogluon")
+
+    def test_standard_default_call_returns_string_unchanged(self):
+        # Backward compatibility: the plain call still returns only a string and
+        # uses the text-only retrieval path exactly once.
+        agrag = self._build_agrag()
+        out = agrag.generate_response("q")
+        self.assertIsInstance(out, str)
+        agrag.retriever_module.retrieve.assert_called_once()
+
+    def test_standard_return_trace_handles_no_retrieval(self):
+        agrag = self._build_agrag()
+        agrag.retriever_module.top_k = 0
+        answer, trace = agrag.generate_response("q", mode="standard", return_trace=True)
+        agrag.retriever_module.retrieve.assert_not_called()
+        self.assertEqual(trace["evidence"], [])
+        self.assertEqual(trace["metrics"]["retrieval_calls"], 0)
+
     def test_resolve_mode_precedence(self):
         agrag = self._build_agrag()
         # Explicit arg wins.

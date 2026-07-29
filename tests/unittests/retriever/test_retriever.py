@@ -154,6 +154,57 @@ class TestRetrieverModule(unittest.TestCase):
 
         self.assertIsNone(self.retriever_module.retrieve(query, return_metadata=True))
 
+    @patch("agrag.modules.retriever.rerankers.reranker.Reranker.rerank")
+    def test_retrieve_text_drops_faiss_negative_sentinel(self, mock_rerank):
+        # FAISS returns -1 for empty slots when there are fewer than top_k hits.
+        # -1 must be dropped, never mapped to metadata.iloc[-1] (the last row).
+        query = "test query"
+        self.vector_database_module.search_vector_database.return_value = [0, -1]
+        self.vector_database_module.metadata = pd.DataFrame(
+            [{DOC_TEXT_KEY: "first chunk"}, {DOC_TEXT_KEY: "last chunk"}]
+        )
+        # Reranker is identity so we can assert on the content passed in.
+        mock_rerank.side_effect = lambda q, content: content
+        self.mock_model.return_value = [torch.rand((1, 1, 10))]
+
+        retrieved = self.retriever_module.retrieve(query)
+
+        # Only the valid row survives; the -1 sentinel does not become "last chunk".
+        self.assertEqual(retrieved, ["first chunk"])
+
+    def test_retrieve_metadata_drops_negative_and_out_of_range(self):
+        # Both a negative sentinel (-1) and an out-of-range index (99) must be
+        # dropped while index/score alignment is preserved for the valid rows.
+        query = "test query"
+        self.vector_database_module.search_vector_database.return_value = (
+            [-1, 0, 99, 1],
+            [0.9, 0.8, 0.7, 0.6],
+        )
+        self.vector_database_module.metadata = pd.DataFrame(
+            [
+                {"doc_id": 0, "chunk_id": 0, DOC_TEXT_KEY: "chunk a"},
+                {"doc_id": 0, "chunk_id": 1, DOC_TEXT_KEY: "chunk b"},
+            ]
+        )
+        self.mock_model.return_value = [torch.rand((1, 2, 10))]
+        self.retriever_module.reranker = None
+
+        records = self.retriever_module.retrieve(query, return_metadata=True)
+
+        # Only the in-range rows survive, keeping their score alignment and order.
+        self.assertEqual([r["text"] for r in records], ["chunk a", "chunk b"])
+        self.assertEqual([r["retrieval_score"] for r in records], [0.8, 0.6])
+        self.assertEqual([r["rank"] for r in records], [0, 1])
+
+    def test_retrieve_returns_none_when_all_indices_negative(self):
+        query = "test query"
+        self.vector_database_module.search_vector_database.return_value = ([-1, -1], [0.0, 0.0])
+        self.vector_database_module.metadata = pd.DataFrame([{DOC_TEXT_KEY: "only chunk"}])
+        self.mock_model.return_value = [torch.rand((1, 1, 10))]
+        self.retriever_module.reranker = None
+
+        self.assertIsNone(self.retriever_module.retrieve(query, return_metadata=True))
+
 
 if __name__ == "__main__":
     unittest.main()

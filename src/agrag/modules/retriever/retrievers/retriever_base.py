@@ -7,7 +7,7 @@ import pandas as pd
 
 from agrag.constants import CHUNK_ID_KEY, DOC_ID_KEY, DOC_TEXT_KEY, EMBEDDING_KEY, LOGGER_NAME, PARENT_ID_KEY
 from agrag.modules.embedding.embedding import EmbeddingModule
-from agrag.modules.retriever.fusion import dedup_records, mmr, reciprocal_rank_fusion
+from agrag.modules.retriever.fusion import dedup_records, default_dedup_key, mmr, reciprocal_rank_fusion
 from agrag.modules.retriever.rerankers.reranker import Reranker
 from agrag.modules.retriever.retrievers.sparse_retriever import BM25Retriever
 from agrag.modules.vector_db.vector_database import VectorDatabaseModule
@@ -188,7 +188,11 @@ class RetrieverModule:
             indices = self.vector_database_module.search_vector_database(
                 embedding=query_embedding, top_k=effective_top_k
             )
-            valid_indices = [idx for idx in indices if idx < self.vector_database_module.metadata.shape[0]]
+            n_rows = self.vector_database_module.metadata.shape[0]
+            # FAISS returns -1 for empty slots (fewer than top_k hits); such
+            # sentinels must be dropped, not passed to iloc (iloc[-1] would
+            # silently return the last metadata row).
+            valid_indices = [idx for idx in indices if 0 <= idx < n_rows]
             if not valid_indices:
                 logger.warning("No valid indices returned from the vector database search.")
                 return None
@@ -203,10 +207,11 @@ class RetrieverModule:
         indices, scores = self.vector_database_module.search_vector_database(
             embedding=query_embedding, top_k=effective_top_k, return_scores=True
         )
-        # Keep scores aligned with indices while filtering out-of-range indices.
-        valid_pairs = [
-            (idx, score) for idx, score in zip(indices, scores) if idx < self.vector_database_module.metadata.shape[0]
-        ]
+        # Keep scores aligned with indices while filtering invalid indices.
+        # Only in-range rows (including guarding against the FAISS -1 sentinel)
+        # are kept; index/score alignment and ranking order are preserved.
+        n_rows = self.vector_database_module.metadata.shape[0]
+        valid_pairs = [(idx, score) for idx, score in zip(indices, scores) if 0 <= idx < n_rows]
         if not valid_pairs:
             logger.warning("No valid indices returned from the vector database search.")
             return None
@@ -237,6 +242,154 @@ class RetrieverModule:
         return records
 
     # ------------------------------------------------------------------
+    # Global multi-query fused retrieval (agentic path)
+    # ------------------------------------------------------------------
+    def retrieve_fused(
+        self,
+        subqueries: List[str],
+        original_query: Optional[str] = None,
+        return_metadata: bool = False,
+        top_k: int = None,
+        rrf_k: int = None,
+    ) -> Optional[List[Any]]:
+        """Globally fuse retrieval across several subqueries.
+
+        This is the genuinely-global multi-query pipeline used by the agentic
+        ``MultiQueryRetrieveTool``. It deliberately does NOT call ``retrieve``
+        per subquery (which would rerank, MMR, expand, and truncate *per query*
+        before any global fusion). Instead it collects raw candidates and runs
+        each expensive stage exactly once, globally:
+
+        1. For every subquery, collect *raw* dense (and, when ``use_hybrid``,
+           sparse) ranked candidate lists — no per-query rerank, MMR, expansion,
+           or truncation.
+        2. Run one Reciprocal Rank Fusion across all ``(subquery x signal)``
+           ranked lists.
+        3. Deduplicate by chunk identity while preserving every
+           ``retrieval_queries`` and ``source_signals`` that surfaced the chunk.
+        4. Run the cross-encoder exactly once, globally, against the *original
+           user query* (not a subquery).
+        5. Apply MMR once, globally (when ``use_mmr``).
+        6. Apply final top-k selection.
+        7. Expand parent/neighbor context only after final selection, avoiding
+           duplicate parent contexts while preserving child provenance.
+
+        Parameters
+        ----------
+        subqueries : list of str
+            The retrieval subqueries (plan) to fuse. Each contributes one dense
+            ranked list and, under hybrid retrieval, one sparse ranked list.
+        original_query : str, optional
+            The immutable user question. The single global cross-encoder rerank
+            scores candidates against *this*, so ranking reflects what the user
+            actually asked rather than any one subquery. Defaults to the first
+            subquery when not provided.
+        return_metadata : bool
+            If False, returns expanded text chunks; if True, structured records.
+        top_k : int, optional
+            Final number of chunks to keep. Defaults to the module ``top_k``.
+        rrf_k : int, optional
+            RRF constant override. Defaults to the module ``rrf_k``.
+
+        Returns
+        -------
+        list or None
+            Fused, globally-ranked results (text or records), or ``None`` when no
+            subquery surfaced any valid candidate.
+        """
+        effective_top_k = self.top_k if top_k is None else top_k
+        effective_rrf_k = self.rrf_k if rrf_k is None else rrf_k
+        if not subqueries:
+            return None
+        if original_query is None:
+            original_query = subqueries[0]
+
+        # 1. Raw per-(subquery x signal) candidates, with NO post-processing.
+        ranked_lists, weights, all_hits = self._fused_candidates(subqueries, effective_top_k)
+        if not all_hits:
+            logger.warning("No valid indices returned from fused multi-query retrieval.")
+            return None
+
+        # 3. Dedup on chunk identity (the metadata row is a unique chunk, so
+        # identical text from different documents stays distinct), merging every
+        # retrieval_query / signal that surfaced each chunk.
+        deduped = dedup_records(all_hits, key_fn=self._fused_key)
+        by_key = {self._fused_key(record): record for record in deduped}
+
+        # 2. One global RRF across all (subquery x signal) ranked lists.
+        fused = reciprocal_rank_fusion(ranked_lists, k=effective_rrf_k, weights=weights)
+        ordered: List[Dict[str, Any]] = []
+        for fusion_rank, (key, rrf_score) in enumerate(fused):
+            record = by_key.get(key)
+            if record is None:
+                continue
+            record["rrf_score"] = rrf_score
+            record["fusion_rank"] = fusion_rank
+            ordered.append(record)
+
+        # 4. One global cross-encoder rerank against the ORIGINAL user query.
+        if self.reranker and ordered:
+            ordered = self._rerank_records(original_query, ordered)
+
+        # 5. One global MMR diversity pass.
+        if self.use_mmr and len(ordered) > 1:
+            ordered = self._apply_mmr(original_query, ordered)
+
+        # 6. Final top-k selection (a distinct step, after rerank + MMR).
+        ordered = ordered[:effective_top_k]
+
+        # 7. Context expansion only after final selection.
+        if self.chunk_read or self.parent_store is not None:
+            ordered = self._expand_context(ordered)
+
+        for rank, record in enumerate(ordered):
+            record["rank"] = rank
+            record.pop("row_index", None)
+            record.pop("signal", None)
+
+        if not return_metadata:
+            return [record.get(DOC_TEXT_KEY, "") for record in ordered]
+        return ordered
+
+    def _fused_key(self, record: Dict[str, Any]) -> Any:
+        """Global identity for fusion/dedup in the multi-query path.
+
+        Uses the metadata ``row_index`` when present: each row is a unique chunk,
+        so this both dedups the same chunk seen by several subqueries and keeps
+        identical text from *different* rows (documents) distinct. Falls back to
+        ``(doc_id, chunk_id)`` / text so callers that inject records without a row
+        index still behave sensibly.
+        """
+        if "row_index" in record:
+            return ("row", record["row_index"])
+        return default_dedup_key(record)
+
+    def _fused_candidates(self, subqueries: List[str], top_k: int):
+        """Collect raw dense (+ optional sparse) candidates per subquery.
+
+        Returns ``(ranked_lists, weights, all_hits)`` where each element of
+        ``ranked_lists`` is one ``(subquery x signal)`` ranked list of fusion
+        keys, ``weights`` is the aligned RRF weight per list, and ``all_hits`` is
+        every raw hit (untouched by rerank/MMR/expansion/truncation) for dedup.
+        """
+        ranked_lists: List[List[Any]] = []
+        weights: List[float] = []
+        all_hits: List[Dict[str, Any]] = []
+        for subquery in subqueries:
+            dense_hits = self._dense_hits(subquery, top_k)
+            if dense_hits:
+                ranked_lists.append([self._fused_key(h) for h in dense_hits])
+                weights.append(self.dense_weight)
+                all_hits.extend(dense_hits)
+            if self.use_hybrid:
+                sparse_hits = self._sparse_hits(subquery, top_k)
+                if sparse_hits:
+                    ranked_lists.append([self._fused_key(h) for h in sparse_hits])
+                    weights.append(self.sparse_weight)
+                    all_hits.extend(sparse_hits)
+        return ranked_lists, weights, all_hits
+
+    # ------------------------------------------------------------------
     # Advanced retrieval (hybrid fusion + global rerank + MMR + chunk_read)
     # ------------------------------------------------------------------
     def _dense_hits(self, query: str, top_k: int) -> List[Dict[str, Any]]:
@@ -249,7 +402,9 @@ class RetrieverModule:
         hits = []
         rank = 0
         for idx, score in zip(indices, scores):
-            if idx >= n_rows:
+            # Skip invalid indices, including the FAISS -1 sentinel; iloc[-1]
+            # would otherwise map to the last metadata row.
+            if not 0 <= idx < n_rows:
                 continue
             record = self.vector_database_module.metadata.iloc[idx].to_dict()
             record["row_index"] = int(idx)
@@ -278,7 +433,7 @@ class RetrieverModule:
         hits = []
         rank = 0
         for idx, score in self.sparse_retriever.search(query, top_k):
-            if idx >= n_rows:
+            if not 0 <= idx < n_rows:
                 continue
             record = self.vector_database_module.metadata.iloc[idx].to_dict()
             record["row_index"] = int(idx)
@@ -410,20 +565,39 @@ class RetrieverModule:
         is replaced with an expanded context: a +/-``chunk_read`` neighbor window
         of adjacent chunks in the same document, and/or the parent chunk when a
         parent store is available.
+
+        Deduplication of parent context: when several selected child chunks share
+        the same ``parent_id``, expanding each one independently would emit the
+        identical parent text several times, bloating (and over-weighting) the
+        context. Instead the first (best-ranked) child carrying a given parent
+        keeps the expanded record; later siblings are folded into it, and their
+        provenance (``retrieval_queries``, ``source_signals``) and child identity
+        are preserved on the surviving record. Records without a parent are never
+        collapsed, so distinct chunks are kept.
         """
         metadata = self.vector_database_module.metadata
         has_doc = DOC_ID_KEY in metadata.columns
         has_chunk = CHUNK_ID_KEY in metadata.columns
         parent_cache = self._build_parent_cache()
 
-        for record in records:
-            child_text = record.get("text", "")
-            record["child_text"] = child_text
-            pieces: List[str] = []
+        # Carrier record per already-expanded parent_id, so siblings collapse.
+        parent_carrier: Dict[Any, Dict[str, Any]] = {}
+        expanded: List[Dict[str, Any]] = []
 
-            # Parent chunk (small-to-big): prefer the larger parent context.
+        for record in records:
+            child_text = record.get(DOC_TEXT_KEY, "")
+            record["child_text"] = child_text
             parent_id = record.get(PARENT_ID_KEY)
-            if parent_id is not None and parent_id in parent_cache:
+            has_parent = parent_id is not None and parent_id in parent_cache
+
+            # A sibling of an already-expanded parent: fold provenance in and drop
+            # the duplicate parent context rather than emitting it twice.
+            if has_parent and parent_id in parent_carrier:
+                self._merge_child_provenance(parent_carrier[parent_id], record)
+                continue
+
+            pieces: List[str] = []
+            if has_parent:
                 pieces.append(parent_cache[parent_id])
 
             # Neighbor window within the same document.
@@ -440,5 +614,33 @@ class RetrieverModule:
                     pieces.append(neighbor_text)
 
             if pieces:
-                record["text"] = "\n\n".join(pieces)
-        return records
+                record[DOC_TEXT_KEY] = "\n\n".join(pieces)
+
+            # Track child chunk ids merged into this expanded record (starts with
+            # its own), so folded siblings can be recorded without losing them.
+            own_chunk = record.get(CHUNK_ID_KEY)
+            record["expanded_child_chunk_ids"] = [own_chunk] if own_chunk is not None else []
+            if has_parent:
+                parent_carrier[parent_id] = record
+            expanded.append(record)
+
+        return expanded
+
+    @staticmethod
+    def _merge_child_provenance(carrier: Dict[str, Any], sibling: Dict[str, Any]) -> None:
+        """Fold a dropped sibling's provenance into the surviving parent carrier.
+
+        Preserves which subqueries/signals surfaced the sibling and records its
+        child chunk id, so collapsing duplicate parent contexts never loses child
+        provenance.
+        """
+        for field_name in ("retrieval_queries", "source_signals"):
+            merged = carrier.setdefault(field_name, [])
+            for value in sibling.get(field_name, []) or []:
+                if value not in merged:
+                    merged.append(value)
+        sibling_chunk = sibling.get(CHUNK_ID_KEY)
+        if sibling_chunk is not None:
+            child_ids = carrier.setdefault("expanded_child_chunk_ids", [])
+            if sibling_chunk not in child_ids:
+                child_ids.append(sibling_chunk)

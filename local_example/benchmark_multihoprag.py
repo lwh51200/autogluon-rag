@@ -27,6 +27,7 @@ real generator, but the pipeline wiring and per-type deltas are what this shows.
 import argparse
 import json
 import os
+import random
 import time
 
 from datasets import load_dataset
@@ -51,21 +52,8 @@ CORPUS_CONFIG = "corpus"
 QUERY_CONFIG = "MultiHopRAG"
 # Pure-Python exact-match metric (no model download); matches the NQ benchmark.
 METRICS = ["inclusive_exact_match"]
-
-
-class TimedRAG(AutoGluonRAG):
-    """AutoGluonRAG that records per-call latency, bucketed by the current mode."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._bench_mode = "standard"
-        self._bench_timings = {"standard": [], "agentic": []}
-
-    def generate_response(self, query, mode=None, return_trace=None):
-        start = time.perf_counter()
-        result = super().generate_response(query, mode=mode, return_trace=return_trace)
-        self._bench_timings[self._bench_mode].append(time.perf_counter() - start)
-        return result
+# Fixed seed for reproducible query-row selection (shared across both modes).
+DEFAULT_SEED = 1234
 
 
 def _cost_summary(timings):
@@ -128,54 +116,95 @@ def ingest_corpus(evaluation_dir, max_docs=None):
     return corpus_dir
 
 
-def _texts_from_records(records):
-    """Pull ordered chunk texts from retriever records (already best-first)."""
-    if not records:
-        return []
-    out = []
-    for rec in records:
-        if isinstance(rec, dict):
-            out.append(rec.get("text", ""))
-        else:
-            out.append(str(rec))
-    return out
+def run_query(agrag, query, mode):
+    """Execute ONE comparable run for ``query`` in ``mode`` and time all of it.
 
+    Both modes now go through a single ``generate_response(..., return_trace=True)``
+    call, so exactly one retrieval + generation happens per standard query (the
+    previous code retrieved once for scoring and again inside generation). The
+    whole comparable operation -- retrieval and generation -- is timed for both.
 
-def retrieved_texts_for_query(agrag, query, mode):
-    """Return the ranked chunk texts a given mode surfaced for ``query``.
-
-    Standard mode: a single retrieval call (what the generator actually saw).
-    Agentic mode: the union of evidence accumulated across all sub-query
-    retrieval rounds, ordered by the trace's evidence list -- this is the
-    multi-round retrieval whose coverage should beat the single-shot path.
-
-    Returns ``(texts, generated_answer, agent_metrics)`` so the caller reuses the
-    same run for answer-quality, retrieval scoring, and decomposition signals (no
-    double generation). ``agent_metrics`` is ``None`` for the standard path and,
-    for the agentic path, the trace's per-run metrics (retrieval_calls,
-    subqueries count, iterations) that reveal whether the planner actually
-    decomposed the query -- if not, agentic degenerates to a single-shot run.
+    Returns a dict with the answer, the ranked evidence texts the answer was
+    conditioned on (best-first), the full serializable trace, per-query latency,
+    and agentic decomposition metrics (``None`` for standard).
     """
-    if mode == "agentic":
-        answer, trace = agrag.generate_response(query, mode="agentic", return_trace=True)
-        trace = trace if isinstance(trace, dict) else {}
-        evidence = trace.get("evidence", [])
-        # Evidence is already stored best-first per retrieval; keep that order.
-        texts = [ev.get("text", "") for ev in evidence]
+    resolved = mode or "standard"
+    start = time.perf_counter()
+    answer, trace = agrag.generate_response(query, mode=resolved, return_trace=True)
+    latency = time.perf_counter() - start
+
+    trace = trace if isinstance(trace, dict) else {}
+    evidence = trace.get("evidence", []) or []
+    # Evidence is stored best-first per retrieval in both modes; keep that order.
+    texts = [ev.get("text", "") for ev in evidence]
+
+    agent_metrics = None
+    if resolved == "agentic":
         tmetrics = trace.get("metrics", {}) or {}
         agent_metrics = {
             "retrieval_calls": tmetrics.get("retrieval_calls", 0),
             "num_subqueries": len(trace.get("subqueries", []) or []),
             "iterations": tmetrics.get("iterations", 0),
         }
-        return texts, answer, agent_metrics
 
-    # Standard path: retrieve exactly what the generator will condition on, then
-    # generate. retrieve() returns None when nothing matched.
-    records = agrag.retriever_module.retrieve(query, return_metadata=True)
-    texts = _texts_from_records(records)
-    answer = agrag.generate_response(query, mode=None)
-    return texts, answer, None
+    return {
+        "answer": answer,
+        "evidence_texts": texts,
+        "evidence": evidence,
+        "trace": trace,
+        "latency": latency,
+        "agent_metrics": agent_metrics,
+    }
+
+
+def select_query_indices(queries_ds, max_eval_size, seed, stratify=False):
+    """Select the query-row indices to evaluate, reproducibly.
+
+    The SAME indices are used for both modes so the comparison is paired. Only
+    rows with a non-empty expected answer are eligible (the metrics need a
+    reference). Selection is deterministic given ``seed``.
+
+    stratify=False : first ``max_eval_size`` eligible rows in dataset order
+        (stable, and identical to the legacy "first N" behavior).
+    stratify=True  : reproducible stratified sample by ``question_type`` --
+        eligible rows are bucketed by type, each bucket shuffled with the fixed
+        seed, then round-robined so every type is represented proportionally.
+
+    Returns a sorted list of dataset indices.
+    """
+    eligible = [idx for idx, row in enumerate(queries_ds) if get_multihop_rag_responses(row)]
+    if not max_eval_size or max_eval_size >= len(eligible):
+        return eligible
+
+    if not stratify:
+        return eligible[:max_eval_size]
+
+    buckets = {}
+    for idx in eligible:
+        qtype = get_multihop_rag_question_type(queries_ds[idx])
+        buckets.setdefault(qtype, []).append(idx)
+
+    rng = random.Random(seed)
+    for qtype in sorted(buckets):
+        rng.shuffle(buckets[qtype])
+
+    # Round-robin across types (sorted for determinism) until the quota is met.
+    ordered_types = sorted(buckets)
+    selected = []
+    position = 0
+    while len(selected) < max_eval_size:
+        progressed = False
+        for qtype in ordered_types:
+            bucket = buckets[qtype]
+            if position < len(bucket):
+                selected.append(bucket[position])
+                progressed = True
+                if len(selected) >= max_eval_size:
+                    break
+        if not progressed:
+            break
+        position += 1
+    return sorted(selected)
 
 
 def build_evaluator(agrag):
@@ -188,23 +217,44 @@ def build_evaluator(agrag):
     return evaluator
 
 
-def run_mode(agrag, evaluator, queries_ds, mode, max_eval_size):
-    """Run one evaluation pass; return overall + per-question-type metrics."""
+def _evidence_provenance(evidence):
+    """Compact per-chunk provenance for the JSONL row (drops bulky embeddings)."""
+    provenance = []
+    for rank, ev in enumerate(evidence):
+        provenance.append(
+            {
+                "rank": ev.get("rank", rank),
+                "doc_id": ev.get("doc_id"),
+                "chunk_id": ev.get("chunk_id"),
+                "source": ev.get("source"),
+                "retrieval_score": ev.get("retrieval_score"),
+                "rerank_score": ev.get("rerank_score"),
+            }
+        )
+    return provenance
+
+
+def run_mode(agrag, evaluator, queries_ds, mode, selected_indices, jsonl_writer=None):
+    """Run one evaluation pass over the pre-selected rows.
+
+    ``selected_indices`` is the shared, reproducible set of dataset indices used
+    for BOTH modes (paired comparison). ``jsonl_writer`` is an optional callable
+    receiving one dict per query, written as a JSONL row. Returns overall +
+    per-question-type metrics plus the per-query latencies gathered here.
+    """
     label = mode or "standard"
-    agrag._bench_mode = label
     print("\n" + "=" * 72)
-    print(f"EVALUATING: {label.upper()} RAG on MultiHop-RAG  (max_eval_size={max_eval_size})")
+    print(f"EVALUATING: {label.upper()} RAG on MultiHop-RAG  (n={len(selected_indices)})")
     print("=" * 72)
 
     # Bucket by question_type so we can score each type separately and aggregate.
-    # Each bucket holds answer-quality inputs plus per-query retrieval metrics.
     buckets = {}
     all_preds, all_refs, all_queries = [], [], []
     all_retrieval = []  # per-query retrieval metrics, non-null queries only
     agent_runs = []  # per-query agentic decomposition signals (agentic mode only)
-    for idx, row in enumerate(queries_ds):
-        if max_eval_size and idx >= max_eval_size:
-            break
+    latencies = []
+    for idx in selected_indices:
+        row = queries_ds[idx]
         expected = get_multihop_rag_responses(row)
         if not expected:
             continue
@@ -212,24 +262,44 @@ def run_mode(agrag, evaluator, queries_ds, mode, max_eval_size):
         qtype = get_multihop_rag_question_type(row)
         gold_facts = get_multihop_rag_evidence_facts(row)
 
-        retrieved_texts, generated, agent_metrics = retrieved_texts_for_query(agrag, query, mode)
-        if agent_metrics is not None:
-            agent_runs.append(agent_metrics)
+        run = run_query(agrag, query, mode)
+        latencies.append(run["latency"])
+        if run["agent_metrics"] is not None:
+            agent_runs.append(run["agent_metrics"])
 
         b = buckets.setdefault(qtype, {"preds": [], "refs": [], "queries": [], "retrieval": []})
-        b["preds"].append(generated)
+        b["preds"].append(run["answer"])
         b["refs"].append(expected)
         b["queries"].append(query)
-        all_preds.append(generated)
+        all_preds.append(run["answer"])
         all_refs.append(expected)
         all_queries.append(query)
 
         # Retrieval scoring needs gold facts; null_query rows have none, so they
         # are excluded from retrieval metrics (undefined) but still answer-scored.
+        rmetrics = {}
         if gold_facts:
-            rmetrics = retrieval_metrics_for_query(retrieved_texts, gold_facts)
+            rmetrics = retrieval_metrics_for_query(run["evidence_texts"], gold_facts)
             b["retrieval"].append(rmetrics)
             all_retrieval.append(rmetrics)
+
+        if jsonl_writer is not None:
+            jsonl_writer(
+                {
+                    "mode": label,
+                    "dataset_index": idx,
+                    "question_type": qtype,
+                    "query": query,
+                    "references": expected,
+                    "prediction": run["answer"],
+                    "evidence_texts": run["evidence_texts"],
+                    "evidence_provenance": _evidence_provenance(run["evidence"]),
+                    "retrieval_metrics": rmetrics,
+                    "latency_s": round(run["latency"], 4),
+                    "agent_metrics": run["agent_metrics"],
+                    "trace": run["trace"],
+                }
+            )
 
     overall = evaluator.evaluate_responses(predictions=all_preds, references=all_refs, queries=all_queries)
     per_type = {}
@@ -246,7 +316,7 @@ def run_mode(agrag, evaluator, queries_ds, mode, max_eval_size):
         "quality_overall": overall,
         "retrieval_overall": aggregate_retrieval_metrics(all_retrieval),
         "quality_by_question_type": per_type,
-        "cost": _cost_summary(agrag._bench_timings[label]),
+        "cost": _cost_summary(latencies),
     }
     behavior = _agentic_behavior_summary(agent_runs)
     if behavior is not None:
@@ -266,29 +336,65 @@ def main():
     parser.add_argument(
         "--evaluation-dir", default="local_example/evaluation_data_multihoprag", help="Where corpus docs are written."
     )
+    parser.add_argument(
+        "--seed", type=int, default=DEFAULT_SEED, help=f"Seed for reproducible query selection (default: {DEFAULT_SEED})."
+    )
+    parser.add_argument(
+        "--stratify",
+        action="store_true",
+        help="Stratified sampling by question_type (default: first-N eligible rows in dataset order).",
+    )
     args = parser.parse_args()
 
     corpus_dir = ingest_corpus(args.evaluation_dir, max_docs=args.max_corpus_docs)
 
     # One instance -> same ingest, index, embedder, generator for both systems.
-    agrag = TimedRAG(config_file=CONFIG, data_dir=corpus_dir)
+    agrag = AutoGluonRAG(config_file=CONFIG, data_dir=corpus_dir)
     if not agrag.pipeline_initialized:
         agrag.initialize_rag_pipeline()
 
     evaluator = build_evaluator(agrag)
     queries_ds = load_dataset(DATASET, name=QUERY_CONFIG, split="train")
 
+    # Pick the query rows ONCE and reuse the identical set for both modes so the
+    # comparison is paired and reproducible under the fixed seed.
+    selected_indices = select_query_indices(
+        queries_ds, args.max_eval_size, seed=args.seed, stratify=args.stratify
+    )
+    print(
+        f"Selected {len(selected_indices)} query rows "
+        f"(seed={args.seed}, stratify={args.stratify}); same rows used for both modes."
+    )
+
+    os.makedirs(args.evaluation_dir, exist_ok=True)
+    jsonl_path = os.path.join(args.evaluation_dir, "benchmark_predictions.jsonl")
+
     results = {}
-    results["standard"] = run_mode(agrag, evaluator, queries_ds, mode=None, max_eval_size=args.max_eval_size)
-    results["agentic"] = run_mode(agrag, evaluator, queries_ds, mode="agentic", max_eval_size=args.max_eval_size)
+    with open(jsonl_path, "w") as jf:
+        def jsonl_writer(row):
+            jf.write(json.dumps(row, default=str) + "\n")
+
+        results["standard"] = run_mode(
+            agrag, evaluator, queries_ds, mode=None, selected_indices=selected_indices, jsonl_writer=jsonl_writer
+        )
+        results["agentic"] = run_mode(
+            agrag, evaluator, queries_ds, mode="agentic", selected_indices=selected_indices, jsonl_writer=jsonl_writer
+        )
+    print(f"\nSaved per-query predictions to {jsonl_path}")
+
+    results["selection"] = {
+        "seed": args.seed,
+        "stratify": args.stratify,
+        "num_selected": len(selected_indices),
+        "dataset_indices": selected_indices,
+    }
 
     print("\n" + "=" * 72)
     print("SUMMARY  (standard vs. agentic, identical corpus + settings)")
     print("=" * 72)
-    print(json.dumps(results, indent=2, default=str))
+    print(json.dumps({k: v for k, v in results.items() if k != "selection"}, indent=2, default=str))
 
     out = os.path.join(args.evaluation_dir, "benchmark_results.json")
-    os.makedirs(args.evaluation_dir, exist_ok=True)
     with open(out, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"\nSaved results to {out}")
