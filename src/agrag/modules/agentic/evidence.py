@@ -98,6 +98,20 @@ class Evidence:
             return f"doc {self.doc_id}, chunk {self.chunk_id}"
         return self.evidence_id or "unknown"
 
+    def merge_provenance(self, other: "Evidence") -> None:
+        """Fold another duplicate's query provenance into this item.
+
+        Keeps this item's rank/scores (the first occurrence is authoritative) but
+        unions the set of queries that surfaced the chunk into ``retrieval_queries``
+        so subgoal-coverage signals credit every subquery that found it. The order
+        of first appearance is preserved.
+        """
+        merged = list(self.retrieval_queries)
+        for query in [self.retrieval_query] + [other.retrieval_query] + list(other.retrieval_queries):
+            if query and query not in merged:
+                merged.append(query)
+        self.retrieval_queries = merged
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the evidence (used for trace export)."""
         return asdict(self)
@@ -119,6 +133,7 @@ class Evidence:
         """
         known = {
             "text",
+            "rank",
             "doc_id",
             "chunk_id",
             "source",
@@ -150,13 +165,15 @@ class EvidenceStore:
     """Holds structured evidence for a single query.
 
     Deduplicates on ``Evidence.dedup_key()`` so the same chunk retrieved by
-    multiple subqueries is stored once. The first occurrence is kept; later
-    duplicates are dropped (their ranks/queries would otherwise be ambiguous).
+    multiple subqueries is stored once. The first occurrence is kept (its
+    rank/score are authoritative), but the query *provenance* of later duplicates
+    is merged into it so ``retrieval_queries`` records every subquery that
+    surfaced the chunk — subgoal-coverage signals depend on this.
     """
 
     def __init__(self) -> None:
         self._evidence: List[Evidence] = []
-        self._seen: set = set()
+        self._by_key: Dict[Any, Evidence] = {}
         self._counter: int = 0
 
     def __len__(self) -> int:
@@ -168,18 +185,23 @@ class EvidenceStore:
     def add(self, evidence: Evidence) -> bool:
         """Add one piece of evidence.
 
-        Returns ``True`` if it was stored, ``False`` if it was a duplicate.
-        Assigns a stable ``evidence_id`` when the item is stored.
+        Returns ``True`` if it was stored, ``False`` if it was a duplicate. On a
+        duplicate, the incoming item's query provenance (``retrieval_query`` and
+        ``retrieval_queries``) is merged into the stored copy so coverage signals
+        still credit every subquery that found the chunk. Assigns a stable
+        ``evidence_id`` when the item is first stored.
         """
         key = evidence.dedup_key()
-        if key in self._seen:
-            logger.debug("Skipping duplicate evidence with key %s", key)
+        existing = self._by_key.get(key)
+        if existing is not None:
+            logger.debug("Merging duplicate evidence provenance for key %s", key)
+            existing.merge_provenance(evidence)
             return False
-        self._seen.add(key)
         if evidence.evidence_id is None:
             evidence.evidence_id = f"e{self._counter}"
         self._counter += 1
         self._evidence.append(evidence)
+        self._by_key[key] = evidence
         return True
 
     def add_many(self, evidence_items: List[Evidence]) -> int:

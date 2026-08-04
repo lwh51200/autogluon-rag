@@ -11,14 +11,13 @@ The only library change this relies on is ``EvaluationModule`` now forwarding a
 
 Notes / environment constraints
 --------------------------------
-* The original ``medium_quality`` preset uses Amazon Bedrock (Claude Sonnet +
-  Cohere embeddings). Those credentials are unavailable in this environment, so
-  this harness runs the already-cached *local* HuggingFace models from
-  ``local_config.yaml`` (MiniLM embeddings, tiny-gpt2 generator). Both systems
-  share those identical models, so the comparison stays apples-to-apples; the
-  absolute answer-quality numbers are not meaningful with the tiny demo
-  generator -- the pipeline wiring and the cost/latency deltas are what this
-  validates. Swap in a Bedrock/OpenAI/Mistral generator for real quality numbers.
+* This harness runs the models configured in ``local_config.yaml``: MiniLM
+  HuggingFace embeddings + reranker on CPU and an AWS Bedrock Claude Haiku 4.5
+  generator (credentials via the standard AWS chain). Both the standard and
+  agentic systems share those identical models, so the comparison stays
+  apples-to-apples and isolates the answering strategy. Swap the generator in
+  ``local_config.yaml`` (e.g. to a local HuggingFace model) for a no-credentials
+  run.
 """
 
 import argparse
@@ -124,8 +123,7 @@ def main():
     )
     # Second pass (agentic): reuse the already-initialized pipeline + index.
     # The agentic module is lazily initialized from the agent config defaults
-    # (configs/agent/default.yaml) on first use -- with a real generator there is
-    # no need to shrink the context budget the way the tiny-gpt2 demo required.
+    # (configs/agent/default.yaml) on first use.
     results["agentic"] = run_mode(
         agrag, mode="agentic", max_eval_size=args.max_eval_size, save_eval_data=False, evaluation_dir=args.evaluation_dir
     )

@@ -12,6 +12,15 @@ AGENT_USE_QUERY_REWRITE: true
 AGENT_USE_CONTEXT_COMPRESSION: false
 AGENT_USE_VERIFICATION: true
 AGENT_MIN_EVIDENCE_COUNT: 2
+# Minimum fraction of planned subqueries that must have supporting evidence before
+# drafting is the preferred action. When coverage is below this (and a rewrite is
+# still in budget) the policy prefers a rewrite to fill the gap. Only bites when
+# the plan has subqueries; drafting is never removed, so the loop still terminates.
+AGENT_MIN_SUBGOAL_COVERAGE: 0.5
+# Minimum best-evidence relevance score below which the policy prefers a rewrite
+# over drafting. null disables the relevance gate. Scores are only compared when
+# the evidence actually carries them, so a score-less retriever never blocks.
+AGENT_MIN_RELEVANCE: null
 AGENT_RETURN_TRACE: false
 # When true, the QueryPlanner uses the shared generator to decompose the query
 # into retrieval subqueries (validated back into the same list contract), instead

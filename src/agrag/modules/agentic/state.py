@@ -93,8 +93,10 @@ class AgentState:
         it. Lets the trace show what the final draft's verification was even when
         the run ended just after a rewrite cleared ``verification``.
     compressed_context : Optional[str]
-        Context produced by the context-compression tool, if any. Reset to None
-        whenever new evidence is retrieved so it never goes stale.
+        Context produced by the context-compression tool, if any. Reset to None on
+        a rewrite (via ``set_current_query``); compression is chosen just before
+        drafting for the current query, so it is regenerated per query rather than
+        per retrieval.
     iteration : int
         Current loop iteration (0-based).
     status : AgentStatus

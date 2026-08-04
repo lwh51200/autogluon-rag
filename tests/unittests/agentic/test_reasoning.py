@@ -3,6 +3,7 @@ import unittest
 from agrag.modules.agentic.evidence import Evidence, EvidenceStore
 from agrag.modules.agentic.planner import QueryPlanner
 from agrag.modules.agentic.policy import ActionType, DecisionPolicy
+from agrag.modules.agentic.signals import assess_evidence, relevance_score
 from agrag.modules.agentic.state import AgentState
 from agrag.modules.agentic.synthesizer import AnswerSynthesizer
 from agrag.modules.agentic.verifier import AnswerVerifier, VerificationLabel
@@ -221,9 +222,12 @@ class TestDecisionPolicy(unittest.TestCase):
 
     def test_accept_verification(self):
         policy = DecisionPolicy()
-        self.assertTrue(policy.accept_verification({"label": "supported"}))
-        self.assertTrue(policy.accept_verification({"label": "partially_supported"}))
-        self.assertFalse(policy.accept_verification({"label": "unsupported"}))
+        # Acceptance follows the verifier's is_supported boolean, not the label.
+        self.assertTrue(policy.accept_verification({"label": "supported", "is_supported": True}))
+        self.assertTrue(policy.accept_verification({"is_supported": True}))
+        # partially_supported is is_supported=False, so it is NOT accepted.
+        self.assertFalse(policy.accept_verification({"label": "partially_supported", "is_supported": False}))
+        self.assertFalse(policy.accept_verification({"label": "unsupported", "is_supported": False}))
         self.assertFalse(policy.accept_verification({}))
 
 
@@ -566,6 +570,134 @@ class TestStrandsDecisionPolicy(unittest.TestCase):
         action = policy.next_action(self._compression_state(), _store("aa bb cc", "dd ee ff"))
         self.assertEqual(action.type, ActionType.DRAFT_ANSWER)
         self.assertEqual(len(gen.prompts), 1)
+
+
+def _scored_store(*items):
+    """Build a store from (text, retrieval_query, rerank_score) tuples."""
+    store = EvidenceStore()
+    for i, (text, rq, score) in enumerate(items):
+        store.add(
+            Evidence(text=text, doc_id=0, chunk_id=i, retrieval_query=rq, rerank_score=score)
+        )
+    return store
+
+
+class TestEvidenceSignals(unittest.TestCase):
+    def test_coverage_full_when_no_subqueries(self):
+        state = AgentState(original_query="q")  # no subqueries
+        a = assess_evidence(state, _store("a", "b"))
+        self.assertEqual(a.subgoal_coverage, 1.0)
+        self.assertEqual(a.count, 2)
+
+    def test_coverage_fraction_of_subqueries(self):
+        state = AgentState(original_query="q")
+        state.subqueries = ["sub1", "sub2"]
+        # Only sub1 has evidence; sub2 uncovered -> 0.5 coverage.
+        store = _scored_store(("t1", "sub1", 0.9))
+        a = assess_evidence(state, store)
+        self.assertEqual(a.subgoal_coverage, 0.5)
+
+    def test_coverage_matches_multi_query_provenance(self):
+        state = AgentState(original_query="q")
+        state.subqueries = ["sub1", "sub2"]
+        store = EvidenceStore()
+        # retrieval_queries carries both subqueries -> both covered.
+        store.add(Evidence(text="t", doc_id=0, chunk_id=0, retrieval_queries=["sub1", "sub2"]))
+        a = assess_evidence(state, store)
+        self.assertEqual(a.subgoal_coverage, 1.0)
+
+    def test_duplicate_evidence_merges_query_provenance(self):
+        # The non-fused multi-query path adds the same chunk once per subquery
+        # (each with only its own retrieval_query). The store must union that
+        # provenance so both subgoals are credited, not drop the second copy.
+        state = AgentState(original_query="q")
+        state.subqueries = ["sub1", "sub2"]
+        store = EvidenceStore()
+        stored = store.add(Evidence(text="t", doc_id=0, chunk_id=0, retrieval_query="sub1"))
+        merged = store.add(Evidence(text="t", doc_id=0, chunk_id=0, retrieval_query="sub2"))
+        self.assertTrue(stored)
+        self.assertFalse(merged)  # duplicate not stored as a second item
+        self.assertEqual(len(store), 1)
+        item = list(store)[0]
+        self.assertEqual(item.retrieval_queries, ["sub1", "sub2"])
+        self.assertEqual(assess_evidence(state, store).subgoal_coverage, 1.0)
+
+    def test_relevance_uses_strongest_score_and_none_when_absent(self):
+        state = AgentState(original_query="q")
+        # Scores present -> best/mean computed.
+        a = assess_evidence(state, _scored_store(("t1", "q", 0.2), ("t2", "q", 0.8)))
+        self.assertAlmostEqual(a.best_relevance, 0.8)
+        self.assertAlmostEqual(a.mean_relevance, 0.5)
+        # No scores -> None (never blocks drafting).
+        b = assess_evidence(state, _store("t1", "t2"))
+        self.assertIsNone(b.best_relevance)
+        self.assertIsNone(b.mean_relevance)
+
+    def test_relevance_score_prefers_rerank_over_rrf_and_ignores_raw(self):
+        # rerank_score wins when present.
+        ev = Evidence(text="t", retrieval_score=0.1, rrf_score=0.2, rerank_score=0.9)
+        self.assertEqual(relevance_score(ev), 0.9)
+        # falls back to rrf.
+        self.assertEqual(relevance_score(Evidence(text="t", retrieval_score=0.1, rrf_score=0.2)), 0.2)
+        # raw retrieval_score is excluded: its direction depends on the index
+        # metric (an L2 distance is lower-is-better), so it is not a relevance score.
+        self.assertIsNone(relevance_score(Evidence(text="t", retrieval_score=0.1)))
+        self.assertIsNone(relevance_score(Evidence(text="t")))
+
+    def test_contradiction_flag_from_verification(self):
+        state = AgentState(original_query="q")
+        state.set_verification({"label": "conflicting_evidence", "is_supported": False})
+        a = assess_evidence(state, _store("a", "b"))
+        self.assertTrue(a.has_contradiction)
+
+
+class TestPolicyEvidenceAwareness(unittest.TestCase):
+    def _retrieved_state(self, subqueries=None):
+        state = AgentState(original_query="q")
+        if subqueries:
+            state.subqueries = subqueries
+        state.record_action("retrieve", tool_name="RetrieveTool")
+        return state
+
+    def test_weak_coverage_prefers_rewrite(self):
+        # Two subqueries, only one covered -> coverage 0.5 < default 0.5? equal, so
+        # use a stricter threshold to make it weak, and confirm rewrite goes first.
+        state = self._retrieved_state(subqueries=["sub1", "sub2"])
+        store = _scored_store(("t1", "sub1", 0.9))  # sub2 uncovered
+        policy = DecisionPolicy(min_evidence_count=1, max_rewrites=1, min_subgoal_coverage=0.75)
+        action = policy.next_action(state, store)
+        self.assertEqual(action.type, ActionType.REWRITE_QUERY)
+
+    def test_full_coverage_still_drafts(self):
+        state = self._retrieved_state(subqueries=["sub1"])
+        store = _scored_store(("t1", "sub1", 0.9), ("t2", "sub1", 0.8))
+        policy = DecisionPolicy(min_evidence_count=1, max_rewrites=1, min_subgoal_coverage=0.75)
+        action = policy.next_action(state, store)
+        self.assertEqual(action.type, ActionType.DRAFT_ANSWER)
+
+    def test_low_relevance_prefers_rewrite(self):
+        state = self._retrieved_state()
+        store = _scored_store(("t1", "q", 0.1), ("t2", "q", 0.2))
+        policy = DecisionPolicy(min_evidence_count=1, max_rewrites=1, min_relevance=0.5)
+        action = policy.next_action(state, store)
+        self.assertEqual(action.type, ActionType.REWRITE_QUERY)
+
+    def test_scoreless_evidence_never_blocks_draft(self):
+        # No scores at all -> relevance gate cannot fire; drafting stays default.
+        state = self._retrieved_state()
+        policy = DecisionPolicy(min_evidence_count=1, max_rewrites=1, min_relevance=0.9)
+        action = policy.next_action(state, _store("a", "b"))
+        self.assertEqual(action.type, ActionType.DRAFT_ANSWER)
+
+    def test_choice_prompt_includes_quality_signals(self):
+        state = self._retrieved_state(subqueries=["sub1", "sub2"])
+        store = _scored_store(("relevant chunk text here", "sub1", 0.9))
+        policy = DecisionPolicy(min_evidence_count=1, max_rewrites=1)
+        prompt = policy._build_choice_prompt(state, store, [ActionType.DRAFT_ANSWER, ActionType.REWRITE_QUERY])
+        self.assertIn("SUBGOAL COVERAGE", prompt)
+        self.assertIn("BEST RELEVANCE", prompt)
+        self.assertIn("TOP EVIDENCE", prompt)
+        self.assertIn("relevant chunk text here", prompt)
 
 
 if __name__ == "__main__":

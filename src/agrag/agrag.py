@@ -59,10 +59,12 @@ class AutoGluonRAG:
         config_file : str, optional
             Path to the configuration file.
         preset_quality : str, optional
-            Preset quality setting (e.g., "good", "medium", "best"). Default is "medium_quality"
+            Preset quality setting ("low_quality", "medium_quality", or "high_quality"; only
+            "medium_quality" is currently implemented). Default is "medium_quality".
         model_ids : dict, optional
-            Dictionary of model IDs to use for specific modules.
-            Example: {"generator_model_id": "mistral.mistral-7b-instruct-v0:2", "retriever_model_id": "BAAI/bge-large-en", "reranker_model_id": "nv_embed"}
+            Reserved for future use. Currently stored but not consumed by the
+            pipeline; set model names via the config file or ``agrag.args``
+            (e.g. ``generator_model_name``, ``embedding_model``) instead.
         data_dir : str
             The directory containing the data files that will be used for the RAG pipeline
         web_urls : List[str]
@@ -477,6 +479,8 @@ class AutoGluonRAG:
             "use_context_compression": self.args.agent_use_context_compression,
             "use_verification": self.args.agent_use_verification,
             "min_evidence_count": self.args.agent_min_evidence_count,
+            "min_subgoal_coverage": self.args.agent_min_subgoal_coverage,
+            "min_relevance": self.args.agent_min_relevance,
             "use_fused_retrieval": self.args.agent_use_fused_retrieval,
             "rrf_k": self.args.rrf_k,
             "use_llm_planner": self.args.agent_use_llm_planner,

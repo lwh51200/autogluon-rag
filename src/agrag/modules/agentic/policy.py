@@ -36,8 +36,8 @@ from typing import Any, Dict, List, Optional
 
 from agrag.constants import LOGGER_NAME
 from agrag.modules.agentic.evidence import EvidenceStore
+from agrag.modules.agentic.signals import assess_evidence, relevance_score
 from agrag.modules.agentic.state import AgentState
-from agrag.modules.agentic.verifier import VerificationLabel
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -78,9 +78,12 @@ _ACTION_DESCRIPTIONS = {
 _POLICY_INSTRUCTION = (
     "You are the decision policy for an agentic RAG loop. Given the current "
     "state, choose the single best next action from the ALLOWED ACTIONS list. "
-    "Choose only from that list. Prefer drafting an answer once the evidence is "
-    "sufficient; rewrite only when better evidence is plausibly retrievable; "
-    "abstain only when the question is not answerable from the corpus.\n\n"
+    "Choose only from that list. Judge sufficiency from the evidence itself, not "
+    "just its count: prefer drafting when the subgoals are well covered, the "
+    "evidence is relevant, and there is no contradiction; rewrite when coverage "
+    "or relevance is weak (or the evidence conflicts) and better evidence is "
+    "plausibly retrievable; abstain only when the question is not answerable from "
+    "the corpus.\n\n"
     'Return ONLY a JSON object of the form {"action": "<one of the allowed '
     'action values>"} with no markdown, no code fences, and no explanation.\n\n'
 )
@@ -102,6 +105,17 @@ class DecisionPolicy:
     max_context_tokens : int
         Approximate context-token budget; when the collected evidence exceeds it
         and compression is enabled, the policy compresses before drafting.
+    min_subgoal_coverage : float
+        Minimum fraction of planned subqueries that must have supporting evidence
+        before drafting is the *preferred* action. When coverage is below this and
+        a rewrite is still in budget, the policy prefers a rewrite to fill the gap.
+        Only bites when the plan has subqueries; drafting is never removed, so the
+        loop still terminates.
+    min_relevance : Optional[float]
+        Minimum best-evidence relevance score below which the policy prefers a
+        rewrite (when in budget) over drafting. ``None`` disables the relevance
+        gate. Scores are compared only when evidence actually carries them, so a
+        score-less retriever never blocks drafting.
     max_rewrites : int
         Upper bound on query rewrites within a single run.
     max_iterations : Optional[int]
@@ -136,6 +150,8 @@ class DecisionPolicy:
         use_query_rewrite: bool = True,
         use_context_compression: bool = False,
         max_context_tokens: int = 6000,
+        min_subgoal_coverage: float = 0.5,
+        min_relevance: Optional[float] = None,
         max_rewrites: int = 1,
         max_iterations: int = None,
         generator_module=None,
@@ -146,6 +162,8 @@ class DecisionPolicy:
         self.use_query_rewrite = use_query_rewrite
         self.use_context_compression = use_context_compression
         self.max_context_tokens = max_context_tokens
+        self.min_subgoal_coverage = min_subgoal_coverage
+        self.min_relevance = min_relevance
         self.max_rewrites = max_rewrites
         self.max_iterations = max_iterations
         self.generator_module = generator_module
@@ -215,6 +233,32 @@ class DecisionPolicy:
         approx_tokens = sum(len(ev.text.split()) for ev in evidence_store)
         return approx_tokens > self.max_context_tokens
 
+    def _evidence_is_weak(self, state: AgentState, evidence_store: EvidenceStore) -> bool:
+        """Whether the collected evidence looks too weak to draft confidently.
+
+        Weak means any of: incomplete subgoal coverage (plan subqueries left
+        unsupported), best relevance below ``min_relevance`` when a score is
+        available, or a detected contradiction. Signals that are unavailable
+        (no subqueries, no scores) never count as weak, so a score-less retriever
+        or a single-query plan behaves exactly as before.
+
+        Note: in the normal loop a contradiction (``conflicting_evidence``) also
+        sets ``is_supported=False`` on a draft, which routes through the
+        draft-failed guardrail *before* this branch-5 check is reached. The
+        contradiction term is kept as a defensive guard so this predicate stays
+        correct if it is ever consulted from a state without a failed draft.
+        """
+        assessment = assess_evidence(state, evidence_store)
+        if state.subqueries and assessment.subgoal_coverage < self.min_subgoal_coverage:
+            return True
+        if (
+            self.min_relevance is not None
+            and assessment.best_relevance is not None
+            and assessment.best_relevance < self.min_relevance
+        ):
+            return True
+        return assessment.has_contradiction
+
     def next_action(self, state: AgentState, evidence_store: EvidenceStore) -> Action:
         """Choose the next action given the current state and evidence.
 
@@ -264,7 +308,10 @@ class DecisionPolicy:
            budget: compress oversized context first OR draft now.
         5. Otherwise (enough evidence, nothing failing): draft the answer OR, when
            a rewrite is still in budget, rewrite to seek stronger evidence before
-           answering. Draft is the default.
+           answering. Draft is the default, but when the evidence looks weak
+           (incomplete subgoal coverage, low relevance, or a contradiction) the
+           order flips so a rewrite is preferred. Drafting is never removed, so
+           the loop still terminates.
         """
         if not state.retrieved_for_current_query():
             # Multi-query retrieval applies to the initial plan only; a rewritten
@@ -294,7 +341,10 @@ class DecisionPolicy:
 
         # Enough evidence and nothing failing: draft by default, but the LLM may
         # instead rewrite to seek stronger evidence when a rewrite is in budget.
+        # When the evidence looks weak, prefer the rewrite by putting it first.
         if self._can_rewrite(state):
+            if self._evidence_is_weak(state, evidence_store):
+                return [ActionType.REWRITE_QUERY, ActionType.DRAFT_ANSWER]
             return [ActionType.DRAFT_ANSWER, ActionType.REWRITE_QUERY]
         return [ActionType.DRAFT_ANSWER]
 
@@ -371,22 +421,62 @@ class DecisionPolicy:
     def _build_choice_prompt(
         self, state: AgentState, evidence_store: EvidenceStore, legal_actions: List[ActionType]
     ) -> str:
-        """Build a compact state summary + described allowed-action list for the LLM."""
+        """Build a compact state summary + described allowed-action list for the LLM.
+
+        The summary surfaces evidence *quality* (subgoal coverage, best/mean
+        relevance, contradiction) and short snippets of the strongest evidence, so
+        the model reasons over the actual context rather than a bare count.
+        """
         allowed_lines = "\n".join(f"- {a.value}: {_ACTION_DESCRIPTIONS.get(a, '')}" for a in legal_actions)
         drafted = state.draft_answer is not None
         last_label = (state.verification or {}).get("label") if drafted else None
+        assessment = assess_evidence(state, evidence_store)
         summary = (
             f"ORIGINAL QUESTION: {state.original_query}\n"
             f"CURRENT QUERY: {state.current_query}\n"
-            f"EVIDENCE COUNT: {len(evidence_store)}\n"
-            f"ITERATION: {state.iteration}"
+            f"EVIDENCE COUNT: {assessment.count}\n"
+            f"SUBGOAL COVERAGE: {assessment.subgoal_coverage:.2f}"
+            + (f" ({len(state.subqueries)} subqueries)\n" if state.subqueries else " (no subqueries)\n")
+            + (f"BEST RELEVANCE: {assessment.best_relevance:.4f}\n" if assessment.best_relevance is not None else "")
+            + (f"MEAN RELEVANCE: {assessment.mean_relevance:.4f}\n" if assessment.mean_relevance is not None else "")
+            + ("CONTRADICTION DETECTED: yes\n" if assessment.has_contradiction else "")
+            + f"ITERATION: {state.iteration}"
             + (f" of {self.max_iterations}" if self.max_iterations else "")
             + "\n"
             f"DRAFT ATTEMPTED: {drafted}\n"
             + (f"LAST VERIFICATION: {last_label}\n" if last_label else "")
+            + self._evidence_digest(evidence_store)
             + f"ALLOWED ACTIONS:\n{allowed_lines}\n"
         )
         return f"{_POLICY_INSTRUCTION}{summary}"
+
+    @staticmethod
+    def _evidence_digest(evidence_store: EvidenceStore, top_n: int = 3, snippet_chars: int = 200) -> str:
+        """Render short snippets of the strongest evidence for the policy prompt.
+
+        Orders by each item's higher-is-better relevance score (rerank/rrf; scored
+        items first), preserving the retriever's own rank order among items without
+        such a score rather than sorting a raw vector distance. Includes the leading
+        ``snippet_chars`` of the top ``top_n`` items with their citation and score.
+        Returns an empty string when there is no evidence.
+        """
+        items = list(evidence_store)
+        if not items:
+            return ""
+        # Stable sort keeps original (retriever rank) order for ties, so scoreless
+        # items stay in retrieval order instead of being reordered by a distance.
+        ranked = sorted(
+            items,
+            key=lambda ev: (relevance_score(ev) is not None, relevance_score(ev) or 0.0),
+            reverse=True,
+        )
+        lines = ["TOP EVIDENCE:"]
+        for ev in ranked[:top_n]:
+            snippet = " ".join(ev.text.split())[:snippet_chars]
+            score = relevance_score(ev)
+            score_str = f"{score:.4f}" if score is not None else "n/a"
+            lines.append(f"- [{ev.citation()}] (score={score_str}) {snippet}")
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _extract_json(text: str) -> Optional[dict]:
@@ -433,9 +523,14 @@ class DecisionPolicy:
         return chosen
 
     def accept_verification(self, verification: Dict[str, Any]) -> bool:
-        """Whether a verification result is good enough to return the answer."""
-        label = (verification or {}).get("label")
-        return label in (
-            VerificationLabel.SUPPORTED.value,
-            VerificationLabel.PARTIALLY_SUPPORTED.value,
-        )
+        """Whether a verification result is good enough to return the answer.
+
+        Gates on the verifier's ``is_supported`` boolean rather than the label,
+        so the acceptance decision stays consistent with what the verifier
+        computed. ``AnswerVerifier`` sets ``is_supported`` True only for the
+        ``supported`` label, so ``partially_supported``, ``conflicting_evidence``,
+        ``unsupported`` and ``insufficient_evidence`` are all rejected and route
+        through rewrite/abstain. The executor's "unverified" path also sets
+        ``is_supported`` True, so verification-off runs still accept.
+        """
+        return bool((verification or {}).get("is_supported", False))

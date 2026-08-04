@@ -41,7 +41,7 @@ def resolve_generator():
     No API keys are hard-coded. Credentials come from the environment:
       * bedrock     -> standard AWS credential chain (no key in code)
       * openai      -> OPENAI_API_KEY (read by the project's read_openai_key)
-      * huggingface -> local CPU model, no credentials
+      * huggingface -> keep local_config.yaml's generator unchanged
 
     Env vars (all optional):
       AGRAG_GENERATOR_PLATFORM   bedrock | openai | huggingface   (default: bedrock)
@@ -49,7 +49,7 @@ def resolve_generator():
       AWS_REGION / AWS_DEFAULT_REGION   region for bedrock         (default: us-east-1)
 
     Returns ``(platform, model_name, platform_args)`` or ``None`` to keep the
-    config file's generator unchanged (the tiny CPU model).
+    config file's generator unchanged (Bedrock Claude Haiku 4.5 by default).
     """
     platform = os.getenv("AGRAG_GENERATOR_PLATFORM", "bedrock").lower()
 
@@ -73,13 +73,7 @@ def resolve_generator():
 
 
 def agent_config():
-    """Context budget for the agentic path.
-
-    A tiny CPU model needs a small budget to respect its 1024-token window; a
-    real hosted model can use the config defaults.
-    """
-    if resolve_generator() is None:  # tiny local model
-        return {"min_evidence_count": 2, "retrieve_top_k_per_query": 3, "max_context_tokens": 150}
+    """Config for the agentic path (shared retriever/generator; small top-k)."""
     return {"min_evidence_count": 2, "retrieve_top_k_per_query": 3}
 
 
@@ -140,7 +134,9 @@ st.caption(
 
 _override = resolve_generator()
 if _override is None:
-    _gen_platform, _gen_model = "huggingface", "sshleifer/tiny-gpt2 (config default — placeholder text)"
+    # huggingface override -> keep whatever local_config.yaml sets (Bedrock Claude
+    # Haiku 4.5 by default).
+    _gen_platform, _gen_model = "config default", "local_config.yaml (Bedrock Claude Haiku 4.5)"
 else:
     _gen_platform, _gen_model, _ = _override
 

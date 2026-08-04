@@ -74,9 +74,10 @@ agent:
   use_fused_retrieval: true
 
 generator:
-  # Real generator via AWS Bedrock (Claude Haiku 4.5) for meaningful answers.
+  # Generator via AWS Bedrock (Claude Haiku 4.5) for meaningful answers.
   # Active Bedrock Claude models require the "us." inference-profile prefix.
-  # For a fully-local/no-creds run, swap back to sshleifer/tiny-gpt2 (huggingface).
+  # For a no-credentials run, swap this block for a local HuggingFace generator
+  # (e.g. sshleifer/tiny-gpt2 with platform huggingface).
   generator_model_name: us.anthropic.claude-haiku-4-5-20251001-v1:0
   generator_model_platform: bedrock
   num_gpus: 0

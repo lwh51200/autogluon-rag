@@ -1,18 +1,18 @@
 """End-to-end agentic RAG test with REAL modules (no mocks).
 
 Unlike the rest of the agentic suite (which uses fakes), this test drives the
-whole stack — real HuggingFace embedding + generator models, a real FAISS index,
-the real RetrieverModule — through the agentic path. It exists to catch wiring
-regressions that unit tests with fakes cannot, e.g. a retriever/evidence
+whole stack — a real HuggingFace embedding model, a real generator, a real FAISS
+index, the real RetrieverModule — through the agentic path. It exists to catch
+wiring regressions that unit tests with fakes cannot, e.g. a retriever/evidence
 contract drift or a loop-budget default that abstains before it can recover.
 
-It reuses the committed ``local_example`` corpus and its prebuilt FAISS index so
-nothing is re-embedded or written. The models used are tiny CPU models
-(all-MiniLM-L6-v2, tiny-gpt2). The tiny generator produces gibberish, so this
-test asserts the *plumbing* (retrieval finds real evidence, the loop terminates
-with a valid status, a coherent trace is produced) rather than answer quality.
+It reuses the committed ``local_example`` corpus, its prebuilt FAISS index, and
+its config (all-MiniLM-L6-v2 embeddings + a Bedrock Claude Haiku 4.5 generator),
+so nothing is re-embedded or written. The test asserts the *plumbing* (retrieval
+finds real evidence, the loop terminates with a valid status, a coherent trace is
+produced) rather than exact answer text.
 
-If the models are not cached and cannot be downloaded (offline CI), or the
+If the models/credentials are unavailable (offline CI, no AWS access), or the
 prebuilt index is missing, the test skips rather than fails.
 """
 
@@ -64,9 +64,8 @@ class TestAgenticEndToEndRealModules(unittest.TestCase):
 
     def _build_module(self, **overrides):
         # Build the agentic module directly over the real retriever + generator.
-        # Keep the context small: the demo generator (tiny-gpt2) has a hard 1024
-        # token window, so we bound per-query retrieval and context. A real model
-        # (e.g. Mistral 7B) would use the larger defaults from the config.
+        # Keep per-query retrieval and context small so the test stays fast and
+        # cheap; the config defaults would work too.
         from agrag.modules.agentic.agentic_module import AgenticRAGModule
 
         config = {
@@ -89,7 +88,7 @@ class TestAgenticEndToEndRealModules(unittest.TestCase):
         module = self._build_module()
         answer, trace = module.answer("What is AutoGluon", return_trace=True)
 
-        # Plumbing assertions (answer text is gibberish with the tiny model).
+        # Plumbing assertions (we check structure/wiring, not exact answer text).
         self.assertIsInstance(answer, str)
         self.assertTrue(answer)
         self.assertIn(trace["status"], ("answered", "abstained", "max_iterations"))
@@ -116,7 +115,7 @@ class TestAgenticEndToEndRealModules(unittest.TestCase):
         # Exercise the real AutoGluonRAG.generate_response(mode="agentic") entry
         # point (not just the module) so the routing + lazy init are covered.
         # Pre-build a bounded module and attach it so generate_response reuses it
-        # instead of constructing one with the large defaults (tiny-gpt2 ctx cap).
+        # instead of constructing one with the larger config defaults.
         self.agrag.agentic_module = self._build_module()
         answer = self.agrag.generate_response("What is AutoGluon", mode="agentic")
         self.assertIsInstance(answer, str)

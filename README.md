@@ -116,12 +116,12 @@ agent:
   return_trace: false       # return (answer, trace) instead of just answer
 ```
 
-A runnable, fully-local CPU example (no cloud keys required) lives in `local_example/`.
+A runnable example over local documents lives in `local_example/`. It uses HuggingFace embeddings + reranker on CPU and an AWS Bedrock Claude Haiku 4.5 generator by default (credentials via the standard AWS chain); swap the generator in `local_example/local_config.yaml` for a local HuggingFace model to run without cloud credentials.
 
-For a list of configurable parameters that can be passed into the `AutoGluonRAG` class, refer to the tutorial [here](https://github.com/autogluon/autogluon-rag/tree/main/documentation/tutorials/general/code_parameteres.md). 
+For a list of configurable parameters that can be passed into the `AutoGluonRAG` class, refer to the tutorial [here](https://github.com/autogluon/autogluon-rag/tree/main/docs/tutorials/general/code_parameters.md). 
 
 You can also use a configuration file with `AutoGluonRAG`.
-The configuration file contains the specific parameters to use for each module in the RAG pipeline. For an example of a config file, please refer to `example_config.yaml` in `src/agrag/configs/`. For specific details about the parameters in each individual module, refer to the `README` files in each module in `src/agrag/modules/`.
+The configuration file contains the specific parameters to use for each module in the RAG pipeline. For an example of a config file, please refer to `medium_quality_config.yaml` in `src/agrag/configs/presets/`. For specific details about the parameters in each individual module, refer to the `README` files in each module in `src/agrag/modules/`.
 
 There is also a `shared` section in the config file for parameters that do not refer to a specific module. Currently, the parameters in `shared` are: 
 ```python
@@ -132,7 +132,7 @@ pipeline_batch_size: Optional batch size to use for pre-processing stage (Data P
 For more information about the evaluation module, refer to the code in `src/agrag/evaluation` and the instructions [here](https://github.com/autogluon/autogluon-rag/tree/main/src/agrag/evaluation/README.md).
 
 ## Tutorials
-For a list of tutorials on using AutoGluon-RAG in different scenarios, refer to the documentation [here](https://github.com/autogluon/autogluon-rag/tree/main/documentation/tutorial.md)
+For a list of tutorials on using AutoGluon-RAG in different scenarios, refer to the documentation [here](https://github.com/autogluon/autogluon-rag/tree/main/docs/tutorials)
 
 ## Reference
 

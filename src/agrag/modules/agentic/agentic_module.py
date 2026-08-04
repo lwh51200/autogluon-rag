@@ -43,8 +43,9 @@ class AgenticRAGModule:
         Agent configuration (see configs/agent/default.yaml). Recognized keys:
         max_iterations, max_subqueries, retrieve_top_k_per_query,
         use_query_rewrite, use_context_compression, use_verification,
-        min_evidence_count, max_context_tokens, query_prefix,
-        use_llm_planner, use_llm_policy, use_strands_planner, use_strands_policy.
+        min_evidence_count, max_context_tokens, min_subgoal_coverage,
+        min_relevance, query_prefix, use_llm_planner, use_llm_policy,
+        use_strands_planner, use_strands_policy.
     """
 
     def __init__(self, retriever_module, generator_module, config: Optional[Dict[str, Any]] = None):
@@ -60,6 +61,8 @@ class AgenticRAGModule:
         self.use_verification = cfg.get("use_verification", True)
         self.min_evidence_count = cfg.get("min_evidence_count", 2)
         self.max_context_tokens = cfg.get("max_context_tokens", 6000)
+        self.min_subgoal_coverage = cfg.get("min_subgoal_coverage", 0.5)
+        self.min_relevance = cfg.get("min_relevance", None)
         self.query_prefix = cfg.get("query_prefix", "")
         self.use_fused_retrieval = cfg.get("use_fused_retrieval", False)
         self.rrf_k = cfg.get("rrf_k", 60)
@@ -148,6 +151,8 @@ class AgenticRAGModule:
             use_query_rewrite=self.use_query_rewrite,
             use_context_compression=self.use_context_compression,
             max_context_tokens=self.max_context_tokens,
+            min_subgoal_coverage=self.min_subgoal_coverage,
+            min_relevance=self.min_relevance,
             max_iterations=self.max_iterations,
             generator_module=self.generator_module,
             use_llm=self.use_llm_policy,

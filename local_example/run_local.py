@@ -1,7 +1,10 @@
-"""Minimal, fully-local AutoGluon-RAG example.
+"""Minimal AutoGluon-RAG example over local documents.
 
 Builds a RAG pipeline over the local text files in local_example/docs/ using
-HuggingFace models on CPU (no AWS/OpenAI keys required), then answers a query.
+HuggingFace embeddings + reranker on CPU and an AWS Bedrock Claude Haiku 4.5
+generator (per local_config.yaml), then answers a query. Bedrock uses the
+standard AWS credential chain; swap the generator in local_config.yaml for a
+HuggingFace model to run without cloud credentials.
 """
 import os
 
@@ -36,9 +39,9 @@ def main():
         text = chunk.get("text", chunk) if isinstance(chunk, dict) else chunk
         print(f"\n[{i}] {text}")
 
-    # ---- Full generate (tiny model => gibberish text, but proves the wiring) ----
+    # ---- Full generate (retrieve context, then generate the answer) ----
     print("\n" + "=" * 70)
-    print("GENERATED RESPONSE (tiny model, validates plumbing only):")
+    print("GENERATED RESPONSE:")
     print("=" * 70)
     response = agrag.generate_response(query)
     print(response)

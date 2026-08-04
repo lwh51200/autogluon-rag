@@ -1,8 +1,9 @@
 """Run ONE query through each path locally: standard RAG and agentic RAG.
 
-Fully local: HuggingFace tiny models on CPU, no cloud keys. The tiny demo
-generator (sshleifer/tiny-gpt2) produces gibberish text — this validates the
-plumbing of each path, not answer quality.
+Uses local_config.yaml: HuggingFace embeddings + reranker on CPU and an AWS
+Bedrock Claude Haiku 4.5 generator (credentials via the standard AWS chain). Both
+paths share the same retriever and generator, so the only difference is the
+answering strategy.
 """
 import os
 
@@ -26,13 +27,11 @@ def main():
     print("ANSWER:", agrag.generate_response(QUERY))
 
     # ---- 2) AGENTIC RAG path (mode="agentic") ----
-    # Bind a small context budget so tiny-gpt2's 1024-token window is respected;
-    # a real model (e.g. Mistral) would just use the config defaults.
     print("\n" + "=" * 70 + "\nAGENTIC RAG\n" + "=" * 70)
     agrag.agentic_module = AgenticRAGModule(
         agrag.retriever_module,
         agrag.generator_module,
-        config={"min_evidence_count": 2, "retrieve_top_k_per_query": 3, "max_context_tokens": 150},
+        config={"min_evidence_count": 2, "retrieve_top_k_per_query": 3},
     )
     answer, trace = agrag.generate_response(QUERY, mode="agentic", return_trace=True)
     print("ANSWER:", answer)

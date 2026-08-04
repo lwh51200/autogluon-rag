@@ -167,7 +167,7 @@ class Arguments:
         return self.config.get("data", {}).get("login_info", {})
 
     @login_info.setter
-    def web_urls(self, value):
+    def login_info(self, value):
         self.config["data"]["login_info"] = value
 
     @property
@@ -788,6 +788,24 @@ class Arguments:
     @agent_min_evidence_count.setter
     def agent_min_evidence_count(self, value):
         self.config.setdefault("agent", {})["min_evidence_count"] = value
+
+    @property
+    def agent_min_subgoal_coverage(self):
+        return self.config.get("agent", {}).get(
+            "min_subgoal_coverage", self.agent_defaults.get("AGENT_MIN_SUBGOAL_COVERAGE")
+        )
+
+    @agent_min_subgoal_coverage.setter
+    def agent_min_subgoal_coverage(self, value):
+        self.config.setdefault("agent", {})["min_subgoal_coverage"] = value
+
+    @property
+    def agent_min_relevance(self):
+        return self.config.get("agent", {}).get("min_relevance", self.agent_defaults.get("AGENT_MIN_RELEVANCE"))
+
+    @agent_min_relevance.setter
+    def agent_min_relevance(self, value):
+        self.config.setdefault("agent", {})["min_relevance"] = value
 
     @property
     def agent_return_trace(self):
