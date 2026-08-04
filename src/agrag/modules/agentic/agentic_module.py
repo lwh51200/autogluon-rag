@@ -43,7 +43,8 @@ class AgenticRAGModule:
         Agent configuration (see configs/agent/default.yaml). Recognized keys:
         max_iterations, max_subqueries, retrieve_top_k_per_query,
         use_query_rewrite, use_context_compression, use_verification,
-        min_evidence_count, max_context_tokens, query_prefix.
+        min_evidence_count, max_context_tokens, query_prefix,
+        use_llm_planner, use_llm_policy, use_strands_planner, use_strands_policy.
     """
 
     def __init__(self, retriever_module, generator_module, config: Optional[Dict[str, Any]] = None):
@@ -62,10 +63,51 @@ class AgenticRAGModule:
         self.query_prefix = cfg.get("query_prefix", "")
         self.use_fused_retrieval = cfg.get("use_fused_retrieval", False)
         self.rrf_k = cfg.get("rrf_k", 60)
+        self.use_llm_planner = cfg.get("use_llm_planner", False)
+        self.use_llm_policy = cfg.get("use_llm_policy", False)
+        self.use_strands_planner = cfg.get("use_strands_planner", False)
+        self.use_strands_policy = cfg.get("use_strands_policy", False)
 
         self._build_components()
 
+    def _build_strands_backend(self):
+        """Build a shared Strands reasoning backend, or return ``None``.
+
+        A single ``StrandsReasoner`` is shared by the planner and policy when
+        either Strands flag is on. It reuses the generator's Bedrock model id and
+        region so no new model configuration is introduced. Construction is
+        deferred/guarded inside the reasoner, so a missing SDK or bad credentials
+        degrade gracefully to the existing LLM/rule-based paths rather than
+        raising here.
+        """
+        if not (self.use_strands_planner or self.use_strands_policy):
+            return None
+
+        model_id = getattr(self.generator_module, "model_name", None)
+        # Best-effort region discovery from the underlying Bedrock client; falls
+        # back to boto3/SDK default resolution when unavailable.
+        region_name = None
+        generator = getattr(self.generator_module, "generator", None)
+        client = getattr(generator, "client", None)
+        if client is not None:
+            region_name = getattr(getattr(client, "meta", None), "region_name", None)
+
+        if not model_id:
+            logger.warning("Strands backend requested but generator has no model_name; disabling it")
+            return None
+
+        try:
+            from agrag.modules.agentic.strands_backend import StrandsReasoner
+
+            return StrandsReasoner(model_id=model_id, region_name=region_name)
+        except Exception as exc:  # import-time failure must not break construction
+            logger.warning("Could not create Strands backend (%s); using LLM/rule paths", exc)
+            return None
+
     def _build_components(self) -> None:
+        # Shared Strands backend (None unless a Strands flag is on and it builds).
+        strands_backend = self._build_strands_backend()
+
         tools = [
             RetrieveTool(self.retriever_module, top_k=self.retrieve_top_k_per_query),
             MultiQueryRetrieveTool(
@@ -81,7 +123,12 @@ class AgenticRAGModule:
             tools.append(ContextCompressionTool(self.generator_module))
         self.tool_registry = ToolRegistry(tools)
 
-        self.planner = QueryPlanner(max_subqueries=self.max_subqueries)
+        self.planner = QueryPlanner(
+            max_subqueries=self.max_subqueries,
+            generator_module=self.generator_module,
+            use_llm=self.use_llm_planner,
+            strands_backend=strands_backend if self.use_strands_planner else None,
+        )
         self.synthesizer = AnswerSynthesizer(
             self.generator_module,
             max_context_tokens=self.max_context_tokens,
@@ -102,6 +149,9 @@ class AgenticRAGModule:
             use_context_compression=self.use_context_compression,
             max_context_tokens=self.max_context_tokens,
             max_iterations=self.max_iterations,
+            generator_module=self.generator_module,
+            use_llm=self.use_llm_policy,
+            strands_backend=strands_backend if self.use_strands_policy else None,
         )
         self.executor = AgentExecutor(
             tool_registry=self.tool_registry,

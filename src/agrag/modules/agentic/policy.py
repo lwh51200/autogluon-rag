@@ -1,18 +1,38 @@
 """Decision policy for the agentic RAG loop.
 
 The ``DecisionPolicy`` decides the next action: retrieve more evidence, rewrite
-the query, compress context, draft an answer, or abstain. It is a rule-based
-policy driven by the current ``AgentState`` and the collected evidence.
+the query, compress context, draft an answer, or abstain. It is driven by the
+current ``AgentState`` and the collected evidence.
 
 Unlike a fixed pipeline, the policy *reacts to observations*: it retrieves again
 after a query rewrite, and it changes course when a draft fails verification
 (rewriting to gather better evidence rather than re-drafting the same answer).
+
+Three modes are supported, in precedence order Strands > LLM > rule-based:
+
+* **Rule-based** (default): a deterministic priority ordering picks the next
+  action from the set of currently-legal actions.
+* **LLM-backed** (opt-in via ``use_llm`` + a ``generator_module``): the LLM
+  *chooses among the legal actions* the deterministic guardrails allow. The LLM
+  returns only a validated action enum; the arguments for each action are
+  assembled deterministically here, so the model can never emit a query string
+  or tool argument that breaks the executor.
+* **Strands-backed** (opt-in via a ``strands_backend``): a Strands agent driving
+  Bedrock Haiku 4.5 chooses among the legal actions, constrained to that exact
+  set by a JSON-schema enum (Pydantic structured output). It too returns only an
+  action value; ``_build_args`` still assembles arguments deterministically.
+
+In every mode the guardrails (never draft before retrieval, forced abstain when
+out of evidence and budget, the bounded loop) stay structural — the LLM only
+reorders among options that are already safe, and any malformed/illegal choice
+(or backend failure) falls back to the deterministic pick, ``legal_actions[0]``.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from agrag.constants import LOGGER_NAME
 from agrag.modules.agentic.evidence import EvidenceStore
@@ -41,8 +61,33 @@ class Action:
     args: Dict[str, Any] = field(default_factory=dict)
 
 
+# Short, model-facing description of what each action does, so the LLM can choose
+# meaningfully among the legal options rather than by name alone.
+_ACTION_DESCRIPTIONS = {
+    ActionType.RETRIEVE: "run a single retrieval for the current query",
+    ActionType.MULTI_RETRIEVE: "run retrieval over all planned subqueries and merge results",
+    ActionType.REWRITE_QUERY: "reformulate the query to gather better/more evidence, then retrieve again",
+    ActionType.COMPRESS_CONTEXT: "compress the oversized evidence into a smaller grounded context before drafting",
+    ActionType.DRAFT_ANSWER: "draft the final answer now from the evidence already collected",
+    ActionType.ABSTAIN: "give up and abstain because the question cannot be answered from the corpus",
+}
+
+# Prompt for the LLM policy. The model only picks among the legal action values
+# it is given and must emit strict JSON so the choice can be validated without a
+# schema library.
+_POLICY_INSTRUCTION = (
+    "You are the decision policy for an agentic RAG loop. Given the current "
+    "state, choose the single best next action from the ALLOWED ACTIONS list. "
+    "Choose only from that list. Prefer drafting an answer once the evidence is "
+    "sufficient; rewrite only when better evidence is plausibly retrievable; "
+    "abstain only when the question is not answerable from the corpus.\n\n"
+    'Return ONLY a JSON object of the form {"action": "<one of the allowed '
+    'action values>"} with no markdown, no code fences, and no explanation.\n\n'
+)
+
+
 class DecisionPolicy:
-    """Rule-based next-action policy.
+    """Next-action policy for the agentic loop.
 
     Attributes:
     ----------
@@ -66,6 +111,19 @@ class DecisionPolicy:
         with no remaining budget guarantees an abstention and wastes an LLM call.
         When None, the policy assumes budget is always available (legacy
         behavior).
+    generator_module : Optional[GeneratorModule]
+        The shared generator used when ``use_llm`` is enabled. When ``None`` the
+        policy is always rule-based regardless of ``use_llm``.
+    use_llm : bool
+        Whether the LLM chooses among the legal actions. Effective only when a
+        ``generator_module`` is also provided, and only consulted at genuine
+        forks (iterations where more than one action is legal). Single-legal-
+        action iterations are decided structurally without an LLM call.
+    strands_backend : Optional[StrandsReasoner]
+        A Strands/Bedrock reasoning helper. When provided it takes precedence
+        over the raw-LLM path at forks: it chooses one action from the legal set
+        via an enum-constrained schema. ``None`` disables the Strands path. Like
+        the LLM path it is consulted only at genuine forks.
     """
 
     # A rewrite must be followed by at least a re-retrieve and a re-draft to be
@@ -80,6 +138,9 @@ class DecisionPolicy:
         max_context_tokens: int = 6000,
         max_rewrites: int = 1,
         max_iterations: int = None,
+        generator_module=None,
+        use_llm: bool = False,
+        strands_backend=None,
     ):
         self.min_evidence_count = min_evidence_count
         self.use_query_rewrite = use_query_rewrite
@@ -87,6 +148,18 @@ class DecisionPolicy:
         self.max_context_tokens = max_context_tokens
         self.max_rewrites = max_rewrites
         self.max_iterations = max_iterations
+        self.generator_module = generator_module
+        self.use_llm = use_llm
+        self.strands_backend = strands_backend
+
+    @property
+    def _llm_enabled(self) -> bool:
+        return self.use_llm and self.generator_module is not None
+
+    @property
+    def _fork_decider_enabled(self) -> bool:
+        """Whether *some* model backend can choose among legal actions at a fork."""
+        return self.strands_backend is not None or self._llm_enabled
 
     def _rewrite_count(self, state: AgentState) -> int:
         return sum(1 for r in state.history if r.action_type == ActionType.REWRITE_QUERY.value)
@@ -145,36 +218,70 @@ class DecisionPolicy:
     def next_action(self, state: AgentState, evidence_store: EvidenceStore) -> Action:
         """Choose the next action given the current state and evidence.
 
-        Rules:
-        1. If nothing has been retrieved for the *current* query, retrieve (multi
-           on the first retrieval when the plan has subqueries, else single). A
-           rewrite changes the current query, so this fires again and the
-           rewritten query is actually used.
-        2. If evidence is below the minimum: rewrite the query (if allowed and
-           under the rewrite budget) so retrieval reruns, otherwise abstain.
-        3. If the latest draft failed verification: rewrite to gather better
-           evidence (if allowed), otherwise abstain. This replaces the previous
-           behavior of re-drafting the identical answer until the loop expired.
+        The legal actions for the current state are computed by ``_legal_actions``
+        (the guardrails). When exactly one action is legal it is taken directly.
+        When more than one is legal — the genuine fork — the LLM chooses among
+        them if enabled, otherwise the deterministic priority order (first legal)
+        is used. The chosen action's arguments are always assembled by
+        ``_build_args`` so the executor's ``action.args`` contract is preserved
+        regardless of mode.
+        """
+        legal = self._legal_actions(state, evidence_store)
+
+        if len(legal) == 1:
+            chosen = legal[0]
+        elif self._fork_decider_enabled:
+            chosen = self._llm_choose(state, evidence_store, legal)
+        else:
+            # Deterministic priority: first legal action (preserves prior behavior,
+            # e.g. compress before draft).
+            chosen = legal[0]
+
+        return Action(chosen, self._build_args(chosen, state, evidence_store))
+
+    def _legal_actions(self, state: AgentState, evidence_store: EvidenceStore) -> List[ActionType]:
+        """Return the actions that are legal in the current state (guardrails).
+
+        The guardrails mirror the original rule cascade so the LLM can never pick
+        an illegal or wasteful action; within those bounds, most branches expose a
+        genuine fork so the LLM policy has real agency. **The first element of
+        every returned list is the deterministic (rule-based) choice**, so a
+        rule-based policy (``use_llm`` off) reproduces the original behavior
+        exactly.
+
+        1. If nothing has been retrieved for the *current* query, retrieval is
+           forced (multi on the first retrieval when the plan has subqueries, else
+           single). No fork: drafting before any evidence is never allowed, and
+           choosing single over multi at the start has little upside for a
+           guaranteed extra LLM call.
+        2. If evidence is below the minimum: rewrite (to gather better evidence)
+           OR abstain (give up as unanswerable), when a rewrite is allowed and in
+           budget; otherwise abstain. Drafting below the evidence floor is never
+           legal (the verifier would short-circuit to insufficient_evidence).
+        3. If the latest draft failed verification: rewrite OR abstain (same fork),
+           when a rewrite is allowed; otherwise abstain.
         4. If context compression is enabled and the evidence exceeds the token
-           budget, compress before drafting.
-        5. Otherwise: draft an answer.
+           budget: compress oversized context first OR draft now.
+        5. Otherwise (enough evidence, nothing failing): draft the answer OR, when
+           a rewrite is still in budget, rewrite to seek stronger evidence before
+           answering. Draft is the default.
         """
         if not state.retrieved_for_current_query():
             # Multi-query retrieval applies to the initial plan only; a rewritten
-            # query is a single reformulation.
+            # query is a single reformulation. Retrieval is forced (no fork).
             if not self._has_retrieved(state) and len(state.plan) > 1:
-                return Action(ActionType.MULTI_RETRIEVE, {"queries": state.plan})
-            return Action(ActionType.RETRIEVE, {"query": state.current_query})
+                return [ActionType.MULTI_RETRIEVE]
+            return [ActionType.RETRIEVE]
 
         if len(evidence_store) < self.min_evidence_count:
             if self._can_rewrite(state):
-                return Action(ActionType.REWRITE_QUERY, {"query": state.current_query})
-            return Action(ActionType.ABSTAIN, {})
+                return [ActionType.REWRITE_QUERY, ActionType.ABSTAIN]
+            return [ActionType.ABSTAIN]
 
         if self._last_draft_failed(state):
             if self._can_rewrite(state):
-                return Action(ActionType.REWRITE_QUERY, {"query": state.current_query})
-            return Action(ActionType.ABSTAIN, {})
+                return [ActionType.REWRITE_QUERY, ActionType.ABSTAIN]
+            return [ActionType.ABSTAIN]
 
         if (
             self.use_context_compression
@@ -182,12 +289,148 @@ class DecisionPolicy:
             and not self._compression_attempted(state)
             and self._context_too_large(evidence_store)
         ):
-            return Action(
-                ActionType.COMPRESS_CONTEXT,
-                {"query": state.current_query, "texts": evidence_store.texts()},
-            )
+            # Genuine choice point: compress oversized context first, or draft now.
+            return [ActionType.COMPRESS_CONTEXT, ActionType.DRAFT_ANSWER]
 
-        return Action(ActionType.DRAFT_ANSWER, {})
+        # Enough evidence and nothing failing: draft by default, but the LLM may
+        # instead rewrite to seek stronger evidence when a rewrite is in budget.
+        if self._can_rewrite(state):
+            return [ActionType.DRAFT_ANSWER, ActionType.REWRITE_QUERY]
+        return [ActionType.DRAFT_ANSWER]
+
+    def _build_args(self, action_type: ActionType, state: AgentState, evidence_store: EvidenceStore) -> Dict[str, Any]:
+        """Assemble the arguments for a chosen action deterministically.
+
+        This is the single source of ``Action.args``; the LLM never supplies
+        arguments, so the executor's reads (``args["query"]`` / ``["queries"]`` /
+        ``["texts"]``) can never be broken by model output.
+        """
+        if action_type == ActionType.RETRIEVE:
+            return {"query": state.current_query}
+        if action_type == ActionType.MULTI_RETRIEVE:
+            return {"queries": state.plan}
+        if action_type == ActionType.REWRITE_QUERY:
+            return {"query": state.current_query}
+        if action_type == ActionType.COMPRESS_CONTEXT:
+            return {"query": state.current_query, "texts": evidence_store.texts()}
+        # DRAFT_ANSWER and ABSTAIN take no arguments.
+        return {}
+
+    def _llm_choose(
+        self, state: AgentState, evidence_store: EvidenceStore, legal_actions: List[ActionType]
+    ) -> ActionType:
+        """Let a model backend choose among the legal actions; validate and guard.
+
+        Precedence is Strands > raw-LLM. Both are given the same state summary and
+        the legal-action set; both return only an action value. Falls back to
+        ``legal_actions[0]`` (the deterministic priority choice) on any backend
+        failure or if a backend picks an action outside the legal set.
+        """
+        prompt = self._build_choice_prompt(state, evidence_store, legal_actions)
+
+        if self.strands_backend is not None:
+            chosen = self._strands_choose(prompt, legal_actions)
+            if chosen is not None:
+                return chosen
+            # Strands failed; fall through to the raw-LLM path if configured.
+
+        if self._llm_enabled:
+            try:
+                raw = self.generator_module.generate_response(prompt)
+            except Exception as exc:  # generator/backend failure must not break the loop
+                logger.debug("LLM policy generation failed (%s); using deterministic choice", exc)
+                return legal_actions[0]
+            return self._parse_action(raw, legal_actions)
+
+        return legal_actions[0]
+
+    def _strands_choose(self, prompt: str, legal_actions: List[ActionType]) -> Optional[ActionType]:
+        """Choose an action via the Strands backend's enum-constrained schema.
+
+        The backend is restricted to exactly the legal action values, so its
+        return is either one of them or ``None`` (on failure). Returns the mapped
+        ``ActionType`` or ``None`` so the caller can fall back.
+        """
+        legal_values = [a.value for a in legal_actions]
+        try:
+            value = self.strands_backend.choose_action(prompt, legal_values)
+        except Exception as exc:  # backend must never break the loop
+            logger.debug("Strands policy call failed (%s); falling back", exc)
+            return None
+        if value is None:
+            return None
+        try:
+            chosen = ActionType(value)
+        except ValueError:
+            logger.debug("Strands policy returned unmappable action %r", value)
+            return None
+        if chosen not in legal_actions:  # defensive; enum already constrains this
+            return None
+        return chosen
+
+    def _build_choice_prompt(
+        self, state: AgentState, evidence_store: EvidenceStore, legal_actions: List[ActionType]
+    ) -> str:
+        """Build a compact state summary + described allowed-action list for the LLM."""
+        allowed_lines = "\n".join(f"- {a.value}: {_ACTION_DESCRIPTIONS.get(a, '')}" for a in legal_actions)
+        drafted = state.draft_answer is not None
+        last_label = (state.verification or {}).get("label") if drafted else None
+        summary = (
+            f"ORIGINAL QUESTION: {state.original_query}\n"
+            f"CURRENT QUERY: {state.current_query}\n"
+            f"EVIDENCE COUNT: {len(evidence_store)}\n"
+            f"ITERATION: {state.iteration}"
+            + (f" of {self.max_iterations}" if self.max_iterations else "")
+            + "\n"
+            f"DRAFT ATTEMPTED: {drafted}\n"
+            + (f"LAST VERIFICATION: {last_label}\n" if last_label else "")
+            + f"ALLOWED ACTIONS:\n{allowed_lines}\n"
+        )
+        return f"{_POLICY_INSTRUCTION}{summary}"
+
+    @staticmethod
+    def _extract_json(text: str) -> Optional[dict]:
+        """Best-effort parse of a JSON object embedded in model output.
+
+        Slices from the first ``{`` to the last ``}`` so leading/trailing prose or
+        code fences do not defeat parsing. Returns the parsed dict, or ``None`` if
+        no JSON object can be recovered.
+        """
+        if not text:
+            return None
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            return None
+        try:
+            obj = json.loads(text[start : end + 1])
+        except (ValueError, TypeError):
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    def _parse_action(self, raw: str, legal_actions: List[ActionType]) -> ActionType:
+        """Validate the model output into a legal ``ActionType``.
+
+        Returns the chosen action only when it parses to a known ``ActionType``
+        that is in ``legal_actions``; otherwise returns ``legal_actions[0]``.
+        """
+        obj = self._extract_json(raw)
+        if obj is None:
+            logger.debug("LLM policy output was not valid JSON: %r", raw)
+            return legal_actions[0]
+        value = obj.get("action")
+        if not isinstance(value, str):
+            logger.debug("LLM policy JSON missing an 'action' string: %r", obj)
+            return legal_actions[0]
+        try:
+            chosen = ActionType(value.strip().lower())
+        except ValueError:
+            logger.debug("LLM policy returned unknown action %r", value)
+            return legal_actions[0]
+        if chosen not in legal_actions:
+            logger.debug("LLM policy chose illegal action %s; using deterministic choice", chosen.value)
+            return legal_actions[0]
+        return chosen
 
     def accept_verification(self, verification: Dict[str, Any]) -> bool:
         """Whether a verification result is good enough to return the answer."""

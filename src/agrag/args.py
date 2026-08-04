@@ -806,3 +806,39 @@ class Arguments:
     @agent_use_fused_retrieval.setter
     def agent_use_fused_retrieval(self, value):
         self.config.setdefault("agent", {})["use_fused_retrieval"] = value
+
+    @property
+    def agent_use_llm_planner(self):
+        return self.config.get("agent", {}).get("use_llm_planner", self.agent_defaults.get("AGENT_USE_LLM_PLANNER"))
+
+    @agent_use_llm_planner.setter
+    def agent_use_llm_planner(self, value):
+        self.config.setdefault("agent", {})["use_llm_planner"] = value
+
+    @property
+    def agent_use_llm_policy(self):
+        return self.config.get("agent", {}).get("use_llm_policy", self.agent_defaults.get("AGENT_USE_LLM_POLICY"))
+
+    @agent_use_llm_policy.setter
+    def agent_use_llm_policy(self, value):
+        self.config.setdefault("agent", {})["use_llm_policy"] = value
+
+    @property
+    def agent_use_strands_planner(self):
+        return self.config.get("agent", {}).get(
+            "use_strands_planner", self.agent_defaults.get("AGENT_USE_STRANDS_PLANNER")
+        )
+
+    @agent_use_strands_planner.setter
+    def agent_use_strands_planner(self, value):
+        self.config.setdefault("agent", {})["use_strands_planner"] = value
+
+    @property
+    def agent_use_strands_policy(self):
+        return self.config.get("agent", {}).get(
+            "use_strands_policy", self.agent_defaults.get("AGENT_USE_STRANDS_POLICY")
+        )
+
+    @agent_use_strands_policy.setter
+    def agent_use_strands_policy(self, value):
+        self.config.setdefault("agent", {})["use_strands_policy"] = value

@@ -64,6 +64,10 @@ agrag = "agrag.main:ag_rag"
 
 [project.optional-dependencies]
 tests = ["pytest", "pytest-mock", "tox", "black>=23.1.9, <=24.10.0", "isort>=5.11.0, <=5.13.2"]
+# Optional Strands-backed agentic planner/policy (Bedrock Haiku 4.5). Only needed
+# when AGENT_USE_STRANDS_PLANNER / AGENT_USE_STRANDS_POLICY are enabled; the
+# agentic path degrades to the LLM/rule-based backends without it.
+strands = ["strands-agents>=1.0,<2.0"]
 
 # Testing and formatting configurations
 [tool.black]

@@ -123,6 +123,79 @@ def calculate_exact_match_score(exact_matches: List[bool]) -> float:
     return exact_match_score
 
 
+def token_f1(prediction: str, references: List[str]) -> float:
+    """Token-level F1 between a prediction and its best-matching reference.
+
+    This is the standard SQuAD / MuSiQue answer-F1: normalize both sides, split on
+    whitespace, and compute F1 over the multiset of shared tokens, taking the max
+    over all references (so answer aliases each get a fair shot). Normalization
+    reuses ``preprocess_text`` (lowercase + strip punctuation) so scoring is
+    consistent with ``inclusive_exact_match_metric``.
+
+    Parameters:
+    ----------
+    prediction : str
+        The generated response.
+    references : List[str]
+        The acceptable reference answers (e.g. gold answer + aliases).
+
+    Returns:
+    -------
+    float
+        The best token-F1 over ``references`` (0.0 if ``references`` is empty).
+    """
+    pred_tokens = preprocess_text(prediction, ignore_case=True, ignore_punctuation=True).split()
+    best = 0.0
+    for ref in references:
+        ref_tokens = preprocess_text(ref, ignore_case=True, ignore_punctuation=True).split()
+        # Edge case: if either side is empty, F1 is 1.0 only when both are empty
+        # (SQuAD convention), otherwise 0.0.
+        if not pred_tokens or not ref_tokens:
+            best = max(best, 1.0 if pred_tokens == ref_tokens else 0.0)
+            continue
+        common = 0
+        ref_counts = {}
+        for tok in ref_tokens:
+            ref_counts[tok] = ref_counts.get(tok, 0) + 1
+        for tok in pred_tokens:
+            if ref_counts.get(tok, 0) > 0:
+                common += 1
+                ref_counts[tok] -= 1
+        if common == 0:
+            continue
+        precision = common / len(pred_tokens)
+        recall = common / len(ref_tokens)
+        f1 = 2 * precision * recall / (precision + recall)
+        best = max(best, f1)
+    return best
+
+
+def f1_metric(predictions: List[str], references: List[List[str]]) -> List[float]:
+    """Per-example token-level answer F1 (MuSiQue's / SQuAD's official metric).
+
+    Parameters:
+    ----------
+    predictions : List[str]
+        The generated responses.
+    references : List[List[str]]
+        The expected responses (one list of acceptable answers per prediction).
+
+    Returns:
+    -------
+    List[float]
+        Per-example best token-F1 against the references.
+    """
+    assert len(predictions) == len(
+        references
+    ), "The length of generated responses and expected responses must be the same."
+    return [token_f1(pred, refs) for pred, refs in zip(predictions, references)]
+
+
+def calculate_f1_score(f1_scores: List[float]) -> float:
+    """Mean token-F1 across examples (0.0 if empty), mirroring calculate_exact_match_score."""
+    return sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
+
+
 def qa_metric_score(
     predictions: List[str],
     references: List[List[str]],

@@ -13,6 +13,29 @@ AGENT_USE_CONTEXT_COMPRESSION: false
 AGENT_USE_VERIFICATION: true
 AGENT_MIN_EVIDENCE_COUNT: 2
 AGENT_RETURN_TRACE: false
+# When true, the QueryPlanner uses the shared generator to decompose the query
+# into retrieval subqueries (validated back into the same list contract), instead
+# of the deterministic regex split. Adds one LLM call per run. Off by default.
+AGENT_USE_LLM_PLANNER: false
+# When true, the DecisionPolicy lets the shared generator choose the next action
+# from the set of currently-legal actions (args are still assembled
+# deterministically). The LLM is consulted only at genuine forks, not every
+# iteration. Off by default.
+AGENT_USE_LLM_POLICY: false
+# When true, the QueryPlanner uses a Strands agent (Bedrock Haiku 4.5) to emit
+# retrieval subqueries as Pydantic-validated structured output, instead of the
+# raw-generator LLM path or the regex split. Takes precedence over
+# AGENT_USE_LLM_PLANNER when both are set. Requires the optional `strands-agents`
+# dependency; if it or Bedrock is unavailable the planner falls back to the LLM
+# path then the rule-based split. Off by default.
+AGENT_USE_STRANDS_PLANNER: false
+# When true, the DecisionPolicy uses a Strands agent (Bedrock Haiku 4.5) to
+# choose the next action from the currently-legal set, constrained to that set by
+# a JSON-schema enum (args are still assembled deterministically). Takes
+# precedence over AGENT_USE_LLM_POLICY at forks. Requires `strands-agents`; falls
+# back to the LLM path then the deterministic choice when unavailable. Off by
+# default.
+AGENT_USE_STRANDS_POLICY: false
 # When true, MultiQueryRetrieveTool runs one genuinely global multi-query
 # pipeline instead of concatenating per-subquery results: it collects raw dense
 # (and, when retriever.USE_HYBRID is on, sparse) candidates for every subquery

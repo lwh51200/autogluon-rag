@@ -479,6 +479,10 @@ class AutoGluonRAG:
             "min_evidence_count": self.args.agent_min_evidence_count,
             "use_fused_retrieval": self.args.agent_use_fused_retrieval,
             "rrf_k": self.args.rrf_k,
+            "use_llm_planner": self.args.agent_use_llm_planner,
+            "use_llm_policy": self.args.agent_use_llm_policy,
+            "use_strands_planner": self.args.agent_use_strands_planner,
+            "use_strands_policy": self.args.agent_use_strands_policy,
             # Share the standard-path query prefix so answer formatting is
             # consistent across standard and agentic modes.
             "query_prefix": self.args.generator_query_prefix,
