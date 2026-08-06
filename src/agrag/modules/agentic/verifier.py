@@ -30,6 +30,17 @@ class VerificationLabel(str, Enum):
 # (e.g. "partially_supported" must be checked before "supported").
 _LABELS_BY_LENGTH = sorted(VerificationLabel, key=lambda label: len(label.value), reverse=True)
 
+# Labels good enough to return the answer. ``partially_supported`` is included so
+# that multi-hop answers grounded in most (but not all) of the required evidence
+# are returned rather than abstained on. ``conflicting_evidence``,
+# ``unsupported`` and ``insufficient_evidence`` are still rejected. This mirrors
+# ``AgenticPolicy.accept_verification``; keeping ``is_supported`` consistent with
+# the accept set matters because the executor's max-iterations fallback gates the
+# best-draft return on ``is_supported`` directly.
+_ACCEPTABLE_LABELS = frozenset(
+    {VerificationLabel.SUPPORTED, VerificationLabel.PARTIALLY_SUPPORTED}
+)
+
 _VERIFY_INSTRUCTION = (
     "You are a strict verifier. Given a QUESTION, a draft ANSWER, and the "
     "EVIDENCE used to produce it, decide how well the evidence supports the "
@@ -98,7 +109,8 @@ class AnswerVerifier:
         -------
         Dict[str, Any]
             ``{"label": <str>, "is_supported": <bool>, "evidence_count": <int>}``.
-            ``is_supported`` is True only for the ``supported`` label.
+            ``is_supported`` is True for the ``supported`` and
+            ``partially_supported`` labels (see ``_ACCEPTABLE_LABELS``).
         """
         evidence_count = len(evidence_store)
         if evidence_count < self.min_evidence_count:
@@ -116,6 +128,6 @@ class AnswerVerifier:
     def _result(label: VerificationLabel, evidence_count: int) -> Dict[str, Any]:
         return {
             "label": label.value,
-            "is_supported": label == VerificationLabel.SUPPORTED,
+            "is_supported": label in _ACCEPTABLE_LABELS,
             "evidence_count": evidence_count,
         }

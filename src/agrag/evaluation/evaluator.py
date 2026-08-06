@@ -15,6 +15,7 @@ from agrag.evaluation.utils import (
     calculate_exact_match_score,
     inclusive_exact_match_metric,
     qa_metric_score,
+    rouge_geometric_mean,
     save_responses_to_csv,
 )
 
@@ -59,6 +60,8 @@ class EvaluationModule:
                     metric_instances[metric] = evaluate.load("exact_match", **self.metric_init_params)
                 elif metric == "inclusive_exact_match":
                     metric_instances[metric] = inclusive_exact_match_metric
+                elif metric == "rouge_gm":
+                    metric_instances[metric] = rouge_geometric_mean
                 elif metric == "pedant":
                     metric_instances[metric] = PEDANT(**self.metric_init_params)
                 elif metric == "transformer_matcher":
@@ -215,6 +218,14 @@ class EvaluationModule:
                     result = calculate_exact_match_score(exact_matches=exact_matches)
                     logger.info(f"Inclusive Exact Match Score: {result}")
 
+                elif metric == "rouge_gm":
+                    result = metric_instance(
+                        predictions=predictions,
+                        references=references,
+                        **self.metric_score_params,
+                    )
+                    logger.info(f"ROUGE geometric mean (F, no stemmer): {result}")
+
                 elif metric == "hf_exact_match":
                     result = metric_instance.compute(
                         predictions=predictions,
@@ -303,7 +314,9 @@ class EvaluationModule:
                 1. From HuggingFace: ["bertscore", "hf_exact_match", "bleu"]
                 2. Inclusive Exact Match: ["exact_match"]
                 3. QA Metrics from https://github.com/zli12321/qa_metrics ("pedant", "transformer_matcher")
-                4. Custom Metric Function: This can either be a callable Python function or a function from a Python package
+                4. ROUGE geometric mean: ["rouge_gm"] -- (ROUGE-1 x ROUGE-2 x ROUGE-L)^(1/3), F-measure, no stemmer.
+                   Returns a dict {"rouge1", "rouge2", "rougeL", "rouge_gm"}.
+                5. Custom Metric Function: This can either be a callable Python function or a function from a Python package
         metric_score_params: dict
             Optional, additional parameters to pass into evaluation metric functions when computing scores.
         metric_init_params: dict

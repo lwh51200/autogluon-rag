@@ -131,12 +131,15 @@ class TestAnswerVerifier(unittest.TestCase):
         self.assertEqual(result["label"], "supported")
         self.assertTrue(result["is_supported"])
 
-    def test_partial_not_matched_as_supported(self):
+    def test_partial_label_parsed_distinctly(self):
+        # "partially_supported" must parse to its own label (not be greedily
+        # matched as the shorter "supported"). It is an acceptable label, so
+        # is_supported is True (see AnswerVerifier._ACCEPTABLE_LABELS).
         gen = FakeGenerator("This is partially_supported by the evidence.")
         verifier = AnswerVerifier(gen, min_evidence_count=1)
         result = verifier.verify("q", "draft", _store("a"))
         self.assertEqual(result["label"], "partially_supported")
-        self.assertFalse(result["is_supported"])
+        self.assertTrue(result["is_supported"])
 
     def test_unparseable_defaults_to_unsupported(self):
         gen = FakeGenerator("I have no idea honestly")
@@ -222,12 +225,18 @@ class TestDecisionPolicy(unittest.TestCase):
 
     def test_accept_verification(self):
         policy = DecisionPolicy()
-        # Acceptance follows the verifier's is_supported boolean, not the label.
+        # Accept on the is_supported boolean...
         self.assertTrue(policy.accept_verification({"label": "supported", "is_supported": True}))
         self.assertTrue(policy.accept_verification({"is_supported": True}))
-        # partially_supported is is_supported=False, so it is NOT accepted.
-        self.assertFalse(policy.accept_verification({"label": "partially_supported", "is_supported": False}))
+        # ...and also on the label, so a partially_supported answer is accepted
+        # even if a caller left is_supported unset/False (the verifier now sets
+        # is_supported True for it, but the label path is the contract).
+        self.assertTrue(policy.accept_verification({"label": "partially_supported", "is_supported": False}))
+        self.assertTrue(policy.accept_verification({"label": "partially_supported", "is_supported": True}))
+        # Everything else is rejected.
         self.assertFalse(policy.accept_verification({"label": "unsupported", "is_supported": False}))
+        self.assertFalse(policy.accept_verification({"label": "conflicting_evidence", "is_supported": False}))
+        self.assertFalse(policy.accept_verification({"label": "insufficient_evidence", "is_supported": False}))
         self.assertFalse(policy.accept_verification({}))
 
 

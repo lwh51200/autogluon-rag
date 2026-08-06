@@ -72,12 +72,6 @@ agent:
   # original query -> one MMR -> top-k -> parent/neighbor expansion). Reuses the
   # retriever's rrf_k / weights / use_mmr / chunk_read / parent store above.
   use_fused_retrieval: true
-  # C1 ablation: coverage gate off (combined with the C1a accept-partial code change).
-  min_subgoal_coverage: 0.0
-  # Multi-hop questions were exhausting the default 5-iteration budget (every
-  # retrievable over-refusal capped at iters=5). Give the loop more room to
-  # decompose/retrieve/draft before falling back to abstain.
-  max_iterations: 8
 
 generator:
   # Generator via AWS Bedrock (Claude Haiku 4.5) for meaningful answers.

@@ -51,7 +51,7 @@ from agrag.evaluation.datasets.musique.musique import (
 )
 from agrag.evaluation.evaluator import EvaluationModule
 from agrag.evaluation.retrieval_metrics import aggregate_retrieval_metrics, retrieval_metrics_for_query
-from agrag.evaluation.utils import calculate_f1_score, f1_metric
+from agrag.evaluation.utils import calculate_f1_score, f1_metric, rouge_geometric_mean
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(REPO_ROOT)
@@ -110,13 +110,16 @@ def _quality_scores(evaluator, predictions, references, queries):
     Exact-match goes through the shared ``EvaluationModule`` (inclusive EM), and
     token-level F1 -- MuSiQue's official answer metric -- is computed directly via
     ``f1_metric``/``calculate_f1_score`` so it is aggregated to a mean (the
-    evaluator's callable-metric path would return the raw per-example list).
+    evaluator's callable-metric path would return the raw per-example list). The
+    ROUGE geometric mean (ROUGE-1 x ROUGE-2 x ROUGE-L)^(1/3) is added the same way,
+    via ``rouge_geometric_mean`` so it is aggregated (mean-then-GM) per bucket.
     """
     if not predictions:
-        return {EM_METRIC: 0.0, "f1": 0.0, "count": 0}
+        return {EM_METRIC: 0.0, "f1": 0.0, "rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0, "rouge_gm": 0.0, "count": 0}
     em = evaluator.evaluate_responses(predictions=predictions, references=references, queries=queries)
     f1 = calculate_f1_score(f1_metric(predictions, references))
-    return {**em, "f1": round(f1, 4), "count": len(predictions)}
+    rouge = rouge_geometric_mean(predictions, references)
+    return {**em, "f1": round(f1, 4), **rouge, "count": len(predictions)}
 
 
 def reindex_question(agrag, paragraph_docs, work_dir):

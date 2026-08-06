@@ -38,7 +38,6 @@ from agrag.constants import LOGGER_NAME
 from agrag.modules.agentic.evidence import EvidenceStore
 from agrag.modules.agentic.signals import assess_evidence, relevance_score
 from agrag.modules.agentic.state import AgentState
-from agrag.modules.agentic.verifier import VerificationLabel
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -526,17 +525,12 @@ class DecisionPolicy:
     def accept_verification(self, verification: Dict[str, Any]) -> bool:
         """Whether a verification result is good enough to return the answer.
 
-        C1a ablation: accept both ``supported`` and ``partially_supported`` labels
-        (rather than gating solely on the verifier's ``is_supported`` boolean, which
-        is True only for ``supported``). ``conflicting_evidence``, ``unsupported``
-        and ``insufficient_evidence`` are still rejected and route through
-        rewrite/abstain. The executor's "unverified" path sets ``is_supported`` True
-        (with no label), so verification-off runs still accept.
+        Gates on the verifier's ``is_supported`` boolean rather than the label,
+        so the acceptance decision stays consistent with what the verifier
+        computed. ``AnswerVerifier`` sets ``is_supported`` True only for the
+        ``supported`` label, so ``partially_supported``, ``conflicting_evidence``,
+        ``unsupported`` and ``insufficient_evidence`` are all rejected and route
+        through rewrite/abstain. The executor's "unverified" path also sets
+        ``is_supported`` True, so verification-off runs still accept.
         """
-        verification = verification or {}
-        if verification.get("is_supported", False):
-            return True
-        return verification.get("label") in (
-            VerificationLabel.SUPPORTED.value,
-            VerificationLabel.PARTIALLY_SUPPORTED.value,
-        )
+        return bool((verification or {}).get("is_supported", False))
