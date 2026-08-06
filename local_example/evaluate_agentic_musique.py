@@ -21,20 +21,24 @@ Metrics (MuSiQue's official pair, plus supporting signals)
 * **Support F1** -- the paper's second official metric: did the system surface the
   gold *supporting* paragraphs? A RAG pipeline does not emit an explicit support
   set, so its retrieved/used evidence set is taken as its support prediction: each
-  retrieved chunk is mapped back (via its ``para_{i}.txt`` source) to a paragraph
-  index, and precision/recall/F1 are computed over paragraph-index sets against
-  the ``is_supporting`` gold. This is an honest RAG analog of the paper's metric,
-  labeled as such -- not the token-level support metric a span-predicting model
-  would report.
+  retrieved chunk is mapped back (via its ``para_{i}.txt`` source) to a GLOBAL
+  corpus paragraph index, and the question's gold supporting paragraphs are
+  translated into the same global index space (``gold_global_support_indices``);
+  precision/recall/F1 are computed over those index sets. This is an honest RAG
+  analog of the paper's metric, labeled as such -- not the token-level support
+  metric a span-predicting model would report.
 
-Fair comparison
----------------
-One ``AutoGluonRAG`` instance loads the models once. For each question its own
-paragraph pool is indexed **once** (the paper's distractor setting), and all three
-backends run against that identical index, so any score difference is attributable
-to the reasoning backend and not to retrieval variance. The three agentic modules
-share the same retriever + generator and are built once, then reused across
-questions (re-indexing mutates the shared retriever in place).
+Global merged corpus
+--------------------
+Rather than the paper's per-question distractor pools, all selected questions'
+paragraphs are merged into ONE deduplicated global corpus, indexed **once**, and
+every question is answered against that whole corpus (``build_global_corpus``) --
+a harder, more realistic global-retrieval setting, deliberately not the paper's
+official distractor benchmark. One ``AutoGluonRAG`` instance loads the models
+once; the three agentic modules share the same retriever + generator built over
+the single global index, so any score difference is attributable to the reasoning
+backend and not to retrieval variance. Total corpus size grows with the number of
+questions, so very large samples will be slow (see ``build_global_corpus``).
 
 Data
 ----
@@ -48,8 +52,8 @@ Environment
 -----------
 Reuses ``local_example/local_config.yaml`` (MiniLM embeddings + Bedrock Claude
 Haiku). Source ``credential.sh`` for Bedrock access before running -- the ``llm``
-and ``strands`` backends make live Bedrock calls; ``rule`` does not. Per-question
-indexes are built in memory and never persisted.
+and ``strands`` backends make live Bedrock calls; ``rule`` does not. The global
+index is built in memory and never persisted.
 
 Usage
 -----
@@ -64,21 +68,20 @@ Usage
 import argparse
 import json
 import os
-import shutil
 import tempfile
 import time
 
 # Reuse the existing runner's building blocks rather than duplicating them: the
-# per-question re-indexing, the evaluator/quality scoring, and the reproducible
+# global corpus builder, the evaluator/quality scoring, and the reproducible
 # row selection are all already correct in benchmark_musique.
 from benchmark_musique import (
     CONFIG,
-    DATASET,
+    DEFAULT_EVAL_SET,
     DEFAULT_SEED,
     DEFAULT_SPLIT,
     build_evaluator,
-    reindex_question,
-    select_query_indices,
+    build_global_corpus,
+    load_rows,
     _quality_scores,
 )
 
@@ -118,44 +121,18 @@ BACKENDS = {
     },
 }
 
-DEFAULT_EVAL_SET = "local_example/evaluation_data_musique/musique_eval_set.jsonl"
-
-
-def load_rows(eval_set_path, from_hf, split, size, seed, stratify, answerable_only):
-    """Yield the MuSiQue rows to evaluate, from the frozen file or HuggingFace.
-
-    Frozen path (default): read the self-contained JSONL built by
-    ``build_musique_eval_set.py`` -- offline and reproducible. HF path
-    (``--from-hf``): load ``dgslibisey/MuSiQue`` and apply the same reproducible
-    selection the frozen builder uses, so both routes evaluate comparable rows.
-    """
-    if not from_hf and os.path.exists(eval_set_path):
-        rows = []
-        with open(eval_set_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
-        print(f"Loaded {len(rows)} frozen MuSiQue rows from {eval_set_path}")
-        return rows
-
-    from datasets import load_dataset
-
-    print(f"Loading {DATASET} split '{split}' from HuggingFace ...")
-    ds = load_dataset(DATASET, split=split)
-    indices = select_query_indices(ds, size, seed=seed, answerable_only=answerable_only, stratify=stratify)
-    rows = [ds[i] for i in indices]
-    print(f"Selected {len(rows)} rows from HuggingFace (seed={seed}, stratify={stratify}).")
-    return rows
+# ``DEFAULT_EVAL_SET`` and ``load_rows`` (frozen-JSONL default, HuggingFace via
+# --from-hf) are shared with benchmark_musique.py and imported above.
 
 
 def _paragraph_index_from_source(source):
     """Map an evidence chunk's ``source`` path (``.../para_{i}.txt``) to index ``i``.
 
-    ``reindex_question`` writes one ``para_{i}.txt`` per ingested paragraph, in the
-    order ``get_musique_paragraph_docs`` returns them; ``get_musique_supporting_flags``
-    uses the identical filtering, so ``i`` indexes the same paragraph in both.
-    Returns ``None`` when the source does not follow that pattern.
+    ``build_global_corpus`` writes one ``para_{i}.txt`` per unique paragraph in the
+    merged global corpus, where ``i`` is the paragraph's GLOBAL index (first-seen
+    order across all questions). ``gold_global_support_indices`` translates a
+    question's gold supporting paragraphs into that same global index space, so the
+    two are comparable. Returns ``None`` when the source does not follow the pattern.
     """
     if not source:
         return None
@@ -166,20 +143,39 @@ def _paragraph_index_from_source(source):
     return int(stem) if stem.isdigit() else None
 
 
-def support_f1(evidence, supporting_flags):
+def gold_global_support_indices(row, doc_to_global):
+    """Global corpus indices of this question's gold supporting paragraphs.
+
+    ``get_musique_supporting_flags(row)`` aligns index-for-index with
+    ``get_musique_paragraph_docs(row)`` (identical filtering/order), so ``flags[i]``
+    says whether the paragraph string ``docs[i]`` is gold-supporting. Each such
+    string is translated to its GLOBAL corpus index via ``doc_to_global`` (the map
+    ``build_global_corpus`` returns), giving the gold support set in the same index
+    space as the ``para_{i}.txt`` sources on retrieved evidence.
+
+    The dedup key in ``build_global_corpus`` and the lookup key here are BOTH the
+    exact ``get_musique_paragraph_docs`` string (title-prepended) -- not the
+    text-only ``get_musique_evidence_facts`` -- so every supporting paragraph is in
+    the map; the ``in`` guard is defensive. Returns a (possibly empty) set.
+    """
+    docs = get_musique_paragraph_docs(row)
+    flags = get_musique_supporting_flags(row)
+    return {doc_to_global[d] for d, flag in zip(docs, flags) if flag and d in doc_to_global}
+
+
+def support_f1(evidence, gold):
     """Support-F1 analog: overlap of *surfaced* vs. *gold-supporting* paragraphs.
 
     ``evidence`` is the list of evidence dicts the run conditioned on (each with a
-    ``source``); ``supporting_flags[i]`` says whether ingested paragraph ``i`` is a
-    gold supporting paragraph. The predicted support set is the distinct paragraph
-    indices that appear in the retrieved evidence; the gold set is the indices
-    flagged supporting. Returns precision / recall / F1 over those sets.
+    ``source``); ``gold`` is the set of GLOBAL corpus indices that are this
+    question's gold supporting paragraphs (from ``gold_global_support_indices``).
+    The predicted support set is the distinct global paragraph indices that appear
+    in the retrieved evidence. Returns precision / recall / F1 over those sets.
 
     Returns ``None`` when there are no gold supporting paragraphs (e.g.
     unanswerable rows), so such rows are excluded from the Support-F1 mean rather
     than counted as trivially perfect or zero.
     """
-    gold = {i for i, flag in enumerate(supporting_flags) if flag}
     if not gold:
         return None
     predicted = set()
@@ -210,11 +206,10 @@ def build_backend_modules(agrag, base_cfg, backend_names):
     """Build one agentic module per requested backend, sharing retriever+generator.
 
     Each module differs only in the planner/policy backend flags overlaid on the
-    shared ``base_cfg``. They wrap the same retriever/generator by reference, so
-    re-indexing a question (which mutates the retriever in place) is visible to all
-    of them -- letting every backend answer against the identical per-question
-    index. Building once (not per question) avoids reloading models and rebuilding
-    the Strands agent on every row.
+    shared ``base_cfg``. They wrap the same retriever/generator by reference, and
+    the global corpus is indexed once before they are built, so every backend
+    answers against the identical global index. Building once (not per question)
+    avoids reloading models and rebuilding the Strands agent on every row.
     """
     modules = {}
     for name in backend_names:
@@ -322,17 +317,13 @@ def main():
         raise SystemExit("No eligible rows with a gold answer; nothing to evaluate.")
     print(f"Evaluating {len(rows)} questions across backends: {args.backends}")
 
-    corpus_dir = os.path.join(tempfile.gettempdir(), "musique_sweep_corpus")
-
-    # Initialize the pipeline once on the first question's paragraphs so the
-    # embedding/reranker/generator models load exactly once.
-    first_docs = get_musique_paragraph_docs(rows[0])
-    if os.path.isdir(corpus_dir):
-        shutil.rmtree(corpus_dir)
-    os.makedirs(corpus_dir, exist_ok=True)
-    for i, doc in enumerate(first_docs):
-        with open(os.path.join(corpus_dir, f"para_{i}.txt"), "w", encoding="utf-8") as f:
-            f.write(doc + "\n")
+    # Merge all questions' paragraphs into ONE deduplicated global corpus, indexed
+    # once, so every backend answers against the identical global corpus (each
+    # question's supporting paragraphs must be found among ALL questions' paragraphs
+    # rather than its own ~20). doc_to_global maps each paragraph string to its
+    # global index, used to translate gold supporting paragraphs for Support-F1.
+    corpus_dir = os.path.join(tempfile.gettempdir(), "musique_sweep_global_corpus")
+    doc_to_global = build_global_corpus(rows, corpus_dir)
 
     agrag = AutoGluonRAG(config_file=CONFIG, data_dir=corpus_dir)
     agrag.args.use_existing_vector_db = False
@@ -356,16 +347,18 @@ def main():
             expected = get_musique_responses(row)
             qtype = get_musique_question_type(row)
             gold_facts = get_musique_evidence_facts(row)
-            support_flags = get_musique_supporting_flags(row)
+            # This question's gold supporting paragraphs as GLOBAL corpus indices,
+            # comparable to the para_{i}.txt sources on retrieved evidence.
+            gold_support = gold_global_support_indices(row, doc_to_global)
 
-            # Index THIS question's paragraph pool once; all backends share it.
-            reindex_question(agrag, get_musique_paragraph_docs(row), corpus_dir)
+            # No per-question re-indexing: all backends query the shared global
+            # corpus indexed once above.
             print(f"[{qi + 1}/{len(rows)}] {qtype}: {query[:70]}...")
 
             for name in args.backends:
                 run = run_backend_on_question(modules[name], query)
                 retrieval = retrieval_metrics_for_query(run["evidence_texts"], gold_facts) if gold_facts else {}
-                support = support_f1(run["evidence"], support_flags)
+                support = support_f1(run["evidence"], gold_support)
                 results[name].append(
                     {
                         "prediction": run["answer"],
@@ -405,7 +398,7 @@ def main():
     summary = {name: summarize_backend(rows_, evaluator) for name, rows_ in results.items()}
 
     print("\n" + "=" * 72)
-    print("BACKEND SWEEP SUMMARY  (agentic MuSiQue; identical per-question index)")
+    print("BACKEND SWEEP SUMMARY  (agentic MuSiQue; shared global corpus)")
     print("=" * 72)
     print(json.dumps(summary, indent=2, default=str))
     print(f"\nSaved per-query predictions to {jsonl_path}")

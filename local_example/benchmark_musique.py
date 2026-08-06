@@ -4,30 +4,53 @@ MuSiQue (Trivedi et al., 2021 -- arXiv:2108.00573; HuggingFace mirror
 ``dgslibisey/MuSiQue``) builds multi-hop questions by *composing* single-hop
 questions, so answering requires 2-4 connected reasoning hops. Its defining
 feature for RAG is that each question ships its OWN ~20-paragraph pool -- a few
-supporting paragraphs plus distractors -- rather than one shared corpus. This is
-the paper's "distractor" setting: the retriever must find the supporting
-paragraphs among plausible distractors, and a single-shot retrieve-then-read
-pipeline is expected to lose ground to a multi-round agentic one as the hop count
-grows.
+supporting paragraphs plus distractors. In the paper's "distractor" setting each
+question is answered against only its own pool.
+
+Global merged corpus (this runner)
+----------------------------------
+To make retrieval closer to real RAG, this runner does NOT use the per-question
+pools in isolation: it **merges every selected question's paragraphs into ONE
+deduplicated global corpus, indexed once**, and answers every question against
+that whole corpus (``build_global_corpus``). A question's supporting paragraphs
+must therefore be found among ALL questions' paragraphs, not just its own 20 --
+a harder, more realistic global-retrieval task, and deliberately no longer the
+paper's official distractor benchmark. Identical Wikipedia paragraphs shared
+across questions are written only once.
 
 How this differs from ``benchmark_multihoprag.py``
 --------------------------------------------------
-MultiHop-RAG has one 609-article corpus indexed ONCE. MuSiQue's corpus is
-per-question, so this runner **re-indexes each question's own paragraphs** before
-querying it. To avoid reloading the embedding / reranker / generator models 30+
-times, it builds those modules once (via ``initialize_rag_pipeline`` on the first
-question) and then, for every subsequent question, resets and rebuilds only the
-vector index + BM25 index + parent store over that question's paragraphs
-(``reindex_question``). Both modes (standard and agentic) then run over the
-identical per-question index through the same ``generate_response(..., mode=...)``
-entry point -- the agentic workflow itself is measured as-is, unmodified.
+MultiHop-RAG has one 609-article corpus indexed ONCE; this runner likewise builds
+a single corpus and index up front (via ``initialize_rag_pipeline`` over the fully
+populated global corpus dir), so the embedding / reranker / generator models load
+once and no per-question re-indexing happens. Both modes (standard and agentic)
+run over the identical global index through the same
+``generate_response(..., mode=...)`` entry point -- the agentic workflow itself is
+measured as-is, unmodified. Note: total corpus size grows with the number of
+questions, so very large samples will be slow (see ``build_global_corpus``).
+
+The agentic run here uses the **LLM planner + policy** (the shared Bedrock
+generator decomposes the query into subqueries and chooses the next action among
+the legal set), not the deterministic regex planner / rule-based action cascade.
+These flags are set in ``main`` on the ``AutoGluonRAG`` instance rather than in
+the yaml, so ``configs/agent/default.yaml`` (LLM off by default) is untouched.
+The three-way rule/llm/strands sweep lives in ``evaluate_agentic_musique.py``.
+
+Data
+----
+By default this reads the frozen, self-contained eval set produced by
+``build_musique_eval_set.py`` (``--eval-set``, default
+``local_example/evaluation_data_musique/musique_eval_set.jsonl``) so runs are
+offline and reproducible. Pass ``--from-hf`` (or delete the frozen file) to load
+``dgslibisey/MuSiQue`` from HuggingFace instead, applying the same reproducible
+row selection. Either way the loaded rows are merged into the global corpus.
 
 Environment note
 ----------------
 Reuses ``local_example/local_config.yaml`` (MiniLM embeddings + Bedrock Claude
 Haiku generator). Source ``credential.sh`` for Bedrock access before running. The
 config's saved-index paths are NOT written to: this runner overrides the vector-DB
-save/load flags in memory so per-question indexes never touch disk.
+save/load flags in memory so the global index never touches disk.
 """
 
 import argparse
@@ -64,6 +87,37 @@ DEFAULT_SPLIT = "validation"
 EM_METRIC = "inclusive_exact_match"
 # Fixed seed for reproducible query-row selection (shared across both modes).
 DEFAULT_SEED = 1234
+# Frozen, self-contained MuSiQue slice produced by build_musique_eval_set.py. Used
+# by default so runs are offline and reproducible (no HuggingFace access needed).
+DEFAULT_EVAL_SET = "local_example/evaluation_data_musique/musique_eval_set.jsonl"
+
+
+def load_rows(eval_set_path, from_hf, split, size, seed, stratify, answerable_only):
+    """Return the MuSiQue rows to evaluate, from the frozen file or HuggingFace.
+
+    Frozen path (default): read the self-contained JSONL built by
+    ``build_musique_eval_set.py`` -- offline and reproducible, no network. Taken
+    whenever ``from_hf`` is False and ``eval_set_path`` exists. HF path
+    (``--from-hf``, or when the frozen file is absent): load ``dgslibisey/MuSiQue``
+    and apply the same reproducible ``select_query_indices`` the frozen builder
+    uses, so both routes evaluate comparable rows.
+    """
+    if not from_hf and os.path.exists(eval_set_path):
+        rows = []
+        with open(eval_set_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        print(f"Loaded {len(rows)} frozen MuSiQue rows from {eval_set_path}")
+        return rows
+
+    print(f"Loading {DATASET} split '{split}' from HuggingFace ...")
+    ds = load_dataset(DATASET, split=split)
+    indices = select_query_indices(ds, size, seed=seed, answerable_only=answerable_only, stratify=stratify)
+    rows = [ds[i] for i in indices]
+    print(f"Selected {len(rows)} rows from HuggingFace (seed={seed}, stratify={stratify}).")
+    return rows
 
 
 def _cost_summary(timings):
@@ -122,43 +176,55 @@ def _quality_scores(evaluator, predictions, references, queries):
     return {**em, "f1": round(f1, 4), **rouge, "count": len(predictions)}
 
 
-def reindex_question(agrag, paragraph_docs, work_dir):
-    """Rebuild the pipeline's index over ONE question's paragraph pool.
+def build_global_corpus(rows, work_dir):
+    """Merge every selected question's paragraphs into ONE deduplicated corpus dir.
 
-    Reuses the already-loaded embedding / reranker / retriever / generator modules
-    and rebuilds only the corpus-dependent state, mirroring the non-batched branch
-    of ``initialize_rag_pipeline`` (agrag.py). Three pieces of per-corpus state
-    must be reset first or evidence would leak across questions:
+    Instead of the paper's per-question distractor pools, this pools *all* selected
+    questions' paragraphs into a single corpus that is indexed once and queried by
+    every question -- so each question's supporting paragraphs must be found among
+    ALL questions' paragraphs (a harder, more realistic global-retrieval setting).
 
-    * ``vector_db_module`` appends on ``construct_vector_database`` (pd.concat +
-      index.add), so its FAISS index and metadata are cleared.
-    * the BM25 ``sparse_retriever`` caches a ``_built`` flag and is only rebuilt
-      when that flag is False.
-    * the retriever's parent-text cache is reset by ``_attach_parent_store_to_retriever``.
+    Paragraphs are deduplicated by exact string identity: the same Wikipedia
+    paragraph appearing in multiple questions is written only once. The identity
+    key is the exact ``get_musique_paragraph_docs`` string (title-prepended), which
+    is also what the index ingests, so a paragraph maps to exactly one global file.
 
-    Then paragraphs are written to fresh ``.txt`` files, the data module is pointed
-    at them, and ``process_data -> generate_embeddings -> construct_vector_db ->
-    attach parent store`` runs -- exactly the steps the initializer uses.
+    Each unique paragraph is written once as ``para_{global_i}.txt`` (``global_i``
+    is first-seen order). Returns ``doc_to_global`` mapping each paragraph string to
+    its global index, so downstream Support-F1 can translate a question's gold
+    supporting paragraphs into global corpus indices (see
+    ``evaluate_agentic_musique.gold_global_support_indices``).
+
+    The corpus dir is populated fully *before* the pipeline is initialized, so the
+    normal one-time ``initialize_rag_pipeline`` build indexes the whole global
+    corpus -- no per-question re-indexing is needed.
+
+    Note on scale: total corpus size grows with the number of questions. The
+    vector DB's duplicate removal builds an O(n^2) similarity matrix and BM25 is a
+    pure-Python O(corpus) scan per query, so very large samples will be slow; the
+    default ~30-question samples (a few hundred paragraphs after dedup) are fine.
     """
-    # Fresh corpus dir for this question.
     if os.path.isdir(work_dir):
         shutil.rmtree(work_dir)
     os.makedirs(work_dir, exist_ok=True)
-    for i, doc in enumerate(paragraph_docs):
-        with open(os.path.join(work_dir, f"para_{i}.txt"), "w", encoding="utf-8") as f:
-            f.write(doc + "\n")
 
-    # Reset per-corpus state so nothing leaks from the previous question.
-    agrag.vector_db_module.index = None
-    agrag.vector_db_module.metadata = agrag.vector_db_module.metadata.iloc[0:0]
-    if getattr(agrag.retriever_module, "sparse_retriever", None) is not None:
-        agrag.retriever_module.sparse_retriever._built = False
-    agrag.data_processing_module.data_dir = work_dir
+    doc_to_global = {}
+    total = 0
+    for row in rows:
+        for doc in get_musique_paragraph_docs(row):
+            total += 1
+            if doc in doc_to_global:
+                continue
+            global_i = len(doc_to_global)
+            doc_to_global[doc] = global_i
+            with open(os.path.join(work_dir, f"para_{global_i}.txt"), "w", encoding="utf-8") as f:
+                f.write(doc + "\n")
 
-    processed_data = agrag.process_data()
-    embeddings = agrag.generate_embeddings(processed_data=processed_data)
-    agrag.construct_vector_db(embeddings=embeddings)
-    agrag._attach_parent_store_to_retriever()
+    print(
+        f"Global corpus: {total} paragraphs across {len(rows)} questions "
+        f"-> {len(doc_to_global)} unique written to {work_dir}"
+    )
+    return doc_to_global
 
 
 def run_query(agrag, query, mode):
@@ -167,8 +233,8 @@ def run_query(agrag, query, mode):
     Both modes go through a single ``generate_response(..., return_trace=True)``
     call, so exactly one retrieval + generation happens per standard query. The
     whole comparable operation -- retrieval and generation -- is timed for both.
-    (The index is already built for the current question by ``reindex_question``;
-    that build is timed separately and not attributed to either mode.)
+    (The global corpus is indexed once up front; that build is not attributed to
+    either mode.)
 
     Returns a dict with the answer, the ranked evidence texts the answer was
     conditioned on (best-first), the full serializable trace, per-query latency,
@@ -287,18 +353,18 @@ def _evidence_provenance(evidence):
     return provenance
 
 
-def run_mode(agrag, evaluator, queries_ds, mode, selected_indices, corpus_dir, jsonl_writer=None):
+def run_mode(agrag, evaluator, rows, mode, jsonl_writer=None):
     """Run one evaluation pass over the pre-selected rows.
 
-    ``selected_indices`` is the shared, reproducible set of dataset indices used
-    for BOTH modes (paired comparison). For each question the per-question index is
-    rebuilt (over that question's paragraphs) before querying. ``jsonl_writer`` is
-    an optional callable receiving one dict per query, written as a JSONL row.
-    Returns overall + per-hop-type metrics plus the per-query latencies.
+    ``rows`` is the shared, reproducible list of MuSiQue rows used for BOTH modes
+    (paired comparison). Every question is queried against the same global corpus,
+    which was merged and indexed once before this call. ``jsonl_writer`` is an
+    optional callable receiving one dict per query, written as a JSONL row. Returns
+    overall + per-hop-type metrics plus the per-query latencies.
     """
     label = mode or "standard"
     print("\n" + "=" * 72)
-    print(f"EVALUATING: {label.upper()} RAG on MuSiQue  (n={len(selected_indices)})")
+    print(f"EVALUATING: {label.upper()} RAG on MuSiQue  (n={len(rows)})")
     print("=" * 72)
 
     # Bucket by hop-count question type so we can score each type separately.
@@ -307,8 +373,7 @@ def run_mode(agrag, evaluator, queries_ds, mode, selected_indices, corpus_dir, j
     all_retrieval = []  # per-query retrieval metrics, rows with gold facts only
     agent_runs = []  # per-query agentic decomposition signals (agentic mode only)
     latencies = []
-    for idx in selected_indices:
-        row = queries_ds[idx]
+    for idx, row in enumerate(rows):
         expected = get_musique_responses(row)
         if not expected:
             continue
@@ -316,9 +381,8 @@ def run_mode(agrag, evaluator, queries_ds, mode, selected_indices, corpus_dir, j
         qtype = get_musique_question_type(row)
         gold_facts = get_musique_evidence_facts(row)
 
-        # Rebuild the index over THIS question's paragraph pool before querying.
-        reindex_question(agrag, get_musique_paragraph_docs(row), corpus_dir)
-
+        # No per-question re-indexing: every question is queried against the same
+        # global corpus that was merged and indexed once before this pass.
         run = run_query(agrag, query, mode)
         latencies.append(run["latency"])
         if run["agent_metrics"] is not None:
@@ -344,7 +408,8 @@ def run_mode(agrag, evaluator, queries_ds, mode, selected_indices, corpus_dir, j
             jsonl_writer(
                 {
                     "mode": label,
-                    "dataset_index": idx,
+                    "row_index": idx,
+                    "source_index": row.get("_source_index"),
                     "question_type": qtype,
                     "answerable": get_musique_answerable(row),
                     "query": query,
@@ -384,10 +449,20 @@ def run_mode(agrag, evaluator, queries_ds, mode, selected_indices, corpus_dir, j
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--max-eval-size", type=int, default=30, help="Number of MuSiQue questions to evaluate (default: 30)."
+        "--eval-set",
+        default=DEFAULT_EVAL_SET,
+        help=f"Frozen MuSiQue JSONL to evaluate offline (default: {DEFAULT_EVAL_SET}).",
     )
     parser.add_argument(
-        "--split", default=DEFAULT_SPLIT, help=f"MuSiQue split to evaluate (default: {DEFAULT_SPLIT})."
+        "--from-hf",
+        action="store_true",
+        help="Ignore the frozen file and load from HuggingFace (needs network).",
+    )
+    parser.add_argument(
+        "--max-eval-size", type=int, default=30, help="Sample size when loading from HuggingFace (default: 30)."
+    )
+    parser.add_argument(
+        "--split", default=DEFAULT_SPLIT, help=f"MuSiQue split when --from-hf (default: {DEFAULT_SPLIT})."
     )
     parser.add_argument(
         "--answerable-only",
@@ -407,40 +482,38 @@ def main():
     )
     args = parser.parse_args()
 
-    queries_ds = load_dataset(DATASET, split=args.split)
-
-    # Pick the query rows ONCE and reuse the identical set for both modes so the
-    # comparison is paired and reproducible under the fixed seed.
-    selected_indices = select_query_indices(
-        queries_ds, args.max_eval_size, seed=args.seed, answerable_only=args.answerable_only, stratify=args.stratify
+    # Load the SAME rows for both modes (paired comparison). Frozen JSONL by
+    # default (offline); HuggingFace only with --from-hf or if the file is absent.
+    rows = load_rows(
+        args.eval_set, args.from_hf, args.split, args.max_eval_size, args.seed, args.stratify, args.answerable_only
     )
-    print(
-        f"Selected {len(selected_indices)} MuSiQue questions from split '{args.split}' "
-        f"(seed={args.seed}, answerable_only={args.answerable_only}, stratify={args.stratify}); "
-        f"same rows used for both modes."
-    )
-    if not selected_indices:
-        raise SystemExit("No eligible questions selected; nothing to evaluate.")
+    # Keep only rows with a usable gold answer (metrics need a reference); with
+    # --answerable-only also drop unanswerable rows (the frozen path may include them).
+    rows = [r for r in rows if get_musique_responses(r)]
+    if args.answerable_only:
+        rows = [r for r in rows if get_musique_answerable(r)]
+    if not rows:
+        raise SystemExit("No eligible questions with a gold answer; nothing to evaluate.")
+    print(f"Evaluating {len(rows)} MuSiQue questions; same rows used for both modes.")
 
-    # Per-question corpus dir (rewritten before each question by reindex_question).
-    corpus_dir = os.path.join(tempfile.gettempdir(), "musique_question_corpus")
-
-    # One instance -> same embedder, reranker, retriever, generator for both
-    # systems. Initialize on the FIRST selected question's paragraphs so the
-    # models load exactly once; every later question reuses them via reindex.
-    first_docs = get_musique_paragraph_docs(queries_ds[selected_indices[0]])
-    if os.path.isdir(corpus_dir):
-        shutil.rmtree(corpus_dir)
-    os.makedirs(corpus_dir, exist_ok=True)
-    for i, doc in enumerate(first_docs):
-        with open(os.path.join(corpus_dir, f"para_{i}.txt"), "w", encoding="utf-8") as f:
-            f.write(doc + "\n")
+    # Merge every selected question's paragraphs into ONE deduplicated global
+    # corpus dir, populated fully before the pipeline is built so the one-time
+    # initialize_rag_pipeline indexes the whole corpus (no per-question reindex).
+    corpus_dir = os.path.join(tempfile.gettempdir(), "musique_global_corpus")
+    build_global_corpus(rows, corpus_dir)
 
     agrag = AutoGluonRAG(config_file=CONFIG, data_dir=corpus_dir)
-    # Never load or persist a shared index: each question is indexed fresh in
+    # Never load or persist a shared index: the global corpus is indexed fresh in
     # memory. Overriding here (not in the yaml) keeps local_config.yaml untouched.
     agrag.args.use_existing_vector_db = False
     agrag.args.save_vector_db_index = False
+    # Drive the agentic path with the LLM planner + policy (via the shared Bedrock
+    # generator) instead of the deterministic regex planner / rule-based action
+    # cascade. The agentic module is built lazily on the first mode="agentic"
+    # query and reads these flags then, so setting them here (not in the yaml)
+    # takes effect while leaving configs/agent/default.yaml untouched.
+    agrag.args.agent_use_llm_planner = True
+    agrag.args.agent_use_llm_policy = True
     if not agrag.pipeline_initialized:
         agrag.initialize_rag_pipeline()
 
@@ -455,27 +528,27 @@ def main():
             jf.write(json.dumps(row, default=str) + "\n")
 
         results["standard"] = run_mode(
-            agrag, evaluator, queries_ds, mode=None, selected_indices=selected_indices,
-            corpus_dir=corpus_dir, jsonl_writer=jsonl_writer,
+            agrag, evaluator, rows, mode=None, jsonl_writer=jsonl_writer,
         )
         results["agentic"] = run_mode(
-            agrag, evaluator, queries_ds, mode="agentic", selected_indices=selected_indices,
-            corpus_dir=corpus_dir, jsonl_writer=jsonl_writer,
+            agrag, evaluator, rows, mode="agentic", jsonl_writer=jsonl_writer,
         )
     print(f"\nSaved per-query predictions to {jsonl_path}")
 
     results["selection"] = {
         "dataset": DATASET,
+        "eval_set": None if args.from_hf else args.eval_set,
+        "from_hf": args.from_hf,
         "split": args.split,
         "seed": args.seed,
         "answerable_only": args.answerable_only,
         "stratify": args.stratify,
-        "num_selected": len(selected_indices),
-        "dataset_indices": selected_indices,
+        "num_selected": len(rows),
+        "source_indices": [r.get("_source_index") for r in rows],
     }
 
     print("\n" + "=" * 72)
-    print("SUMMARY  (standard vs. agentic, identical per-question corpus + settings)")
+    print("SUMMARY  (standard vs. agentic, shared global corpus + settings)")
     print("=" * 72)
     print(json.dumps({k: v for k, v in results.items() if k != "selection"}, indent=2, default=str))
 
