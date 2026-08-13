@@ -83,9 +83,13 @@ class TestQueryPlanner(unittest.TestCase):
         self.assertIn("how does RAG work", plan)
 
     def test_respects_max_subqueries(self):
+        # max_subqueries caps the SUBQUERIES (entries beyond the original), so the
+        # plan holds the original + up to 2 subqueries (<= 3 entries).
         planner = QueryPlanner(max_subqueries=2)
-        plan = planner.create_plan("a is x and b is y and c is z")
-        self.assertLessEqual(len(plan), 2)
+        query = "a is x and b is y and c is z"
+        plan = planner.create_plan(query)
+        self.assertEqual(plan[0], query)
+        self.assertLessEqual(len(plan) - 1, 2)
 
     def test_no_split_on_tiny_fragments(self):
         # "cats and dogs" -> parts are 1 word each, not meaningful; no split.
@@ -142,10 +146,14 @@ class TestAnswerVerifier(unittest.TestCase):
         self.assertTrue(result["is_supported"])
 
     def test_unparseable_defaults_to_unsupported(self):
+        # A reply with no recognizable label token is treated as a rejection: a
+        # parse miss is not evidence of support. (always_answer mode still returns
+        # the draft regardless; it does not relax what the verifier reports.)
         gen = FakeGenerator("I have no idea honestly")
         verifier = AnswerVerifier(gen, min_evidence_count=1)
         result = verifier.verify("q", "draft", _store("a"))
         self.assertEqual(result["label"], "unsupported")
+        self.assertFalse(result["is_supported"])
 
     def test_evidence_block_bounded_by_context_budget(self):
         # Two multi-word chunks; a tiny budget must drop the second chunk from
@@ -223,6 +231,37 @@ class TestDecisionPolicy(unittest.TestCase):
         action = DecisionPolicy(min_evidence_count=2).next_action(state, _store("a", "b"))
         self.assertEqual(action.type, ActionType.DRAFT_ANSWER)
 
+    def test_redraft_after_failed_verification_when_new_evidence(self):
+        # A draft failed verification, but a later retrieval added NEW evidence.
+        # Re-drafting can now succeed, so DRAFT_ANSWER must be offered again (and
+        # be the default, i.e. first legal action). Uses no rewrite budget so the
+        # only way DRAFT reappears is the new-evidence path.
+        state = AgentState(original_query="q")
+        state.record_action("retrieve", tool_name="RetrieveTool", evidence_added=2)
+        state.record_action("draft_answer")
+        state.draft_answer = "draft"
+        state.set_verification({"label": "unsupported", "is_supported": False})
+        # New evidence arrives after the failed draft.
+        state.record_action("retrieve", tool_name="RetrieveTool", evidence_added=1)
+        policy = DecisionPolicy(min_evidence_count=2, max_rewrites=1, max_iterations=5)
+        legal = policy._legal_actions(state, _store("a", "b", "c"))
+        self.assertEqual(legal[0], ActionType.DRAFT_ANSWER)
+        self.assertIn(ActionType.DRAFT_ANSWER, legal)
+
+    def test_no_redraft_after_failed_verification_without_new_evidence(self):
+        # A draft failed and NO new evidence has arrived since. Re-drafting would
+        # only reproduce the rejected answer, so DRAFT must not be re-offered; the
+        # policy falls back to rewrite/abstain so the loop still terminates.
+        state = AgentState(original_query="q")
+        state.record_action("retrieve", tool_name="RetrieveTool", evidence_added=2)
+        state.record_action("draft_answer")
+        state.draft_answer = "draft"
+        state.set_verification({"label": "unsupported", "is_supported": False})
+        policy = DecisionPolicy(min_evidence_count=2, max_rewrites=1, max_iterations=5)
+        legal = policy._legal_actions(state, _store("a", "b"))
+        self.assertNotIn(ActionType.DRAFT_ANSWER, legal)
+        self.assertIn(ActionType.REWRITE_QUERY, legal)
+
     def test_accept_verification(self):
         policy = DecisionPolicy()
         # Accept on the is_supported boolean...
@@ -252,11 +291,20 @@ class TestLLMQueryPlanner(unittest.TestCase):
         self.assertEqual(len(gen.prompts), 1)
 
     def test_respects_max_subqueries(self):
+        # 4 subqueries returned, capped to 2 -> plan = [original, sq1, sq2].
         gen = FakeGenerator('{"subqueries": ["a b", "c d", "e f", "g h"]}')
         planner = QueryPlanner(max_subqueries=2, generator_module=gen, use_llm=True)
         plan = planner.create_plan("original query here")
-        self.assertLessEqual(len(plan), 2)
+        self.assertEqual(plan, ["original query here", "a b", "c d"])
+
+    def test_default_max_subqueries_keeps_four(self):
+        # Default max_subqueries=4 must keep all 4 subqueries (plan len 5) rather
+        # than dropping the last to the original-query slot.
+        gen = FakeGenerator('{"subqueries": ["a b", "c d", "e f", "g h"]}')
+        planner = QueryPlanner(generator_module=gen, use_llm=True)
+        plan = planner.create_plan("original query here")
         self.assertEqual(plan[0], "original query here")
+        self.assertEqual(len(plan) - 1, 4)
 
     def test_dedup_of_original_and_repeats(self):
         gen = FakeGenerator('{"subqueries": ["the query", "the query", "extra one"]}')
@@ -380,11 +428,25 @@ class TestLLMDecisionPolicy(unittest.TestCase):
         return state
 
     def test_low_evidence_llm_can_choose_abstain(self):
-        # Low evidence with a rewrite available is now a fork: rewrite OR abstain.
+        # Low evidence with a rewrite available is a fork (rewrite OR abstain) ONLY
+        # when abstention is allowed; that is the sole mode where the LLM may pick
+        # abstain here. Under the never-refuse default this branch is single-legal
+        # (rewrite) and the LLM is not consulted (see the companion test below).
+        gen = FakeGenerator('{"action": "abstain"}')
+        policy = DecisionPolicy(
+            min_evidence_count=2, max_rewrites=1, generator_module=gen, use_llm=True, allow_abstention=True
+        )
+        action = policy.next_action(self._low_evidence_state(), _store("only one"))
+        self.assertEqual(action.type, ActionType.ABSTAIN)
+
+    def test_low_evidence_never_refuse_forces_rewrite_not_abstain(self):
+        # Never-refuse default: low evidence with a rewrite available is single-legal
+        # (rewrite), so the LLM cannot choose to give up even if it tries.
         gen = FakeGenerator('{"action": "abstain"}')
         policy = DecisionPolicy(min_evidence_count=2, max_rewrites=1, generator_module=gen, use_llm=True)
         action = policy.next_action(self._low_evidence_state(), _store("only one"))
-        self.assertEqual(action.type, ActionType.ABSTAIN)
+        self.assertEqual(action.type, ActionType.REWRITE_QUERY)
+        self.assertEqual(gen.prompts, [])  # single-legal -> LLM not consulted
 
     def test_low_evidence_llm_can_choose_rewrite(self):
         gen = FakeGenerator('{"action": "rewrite_query"}')
@@ -450,11 +512,11 @@ class TestStrandsQueryPlanner(unittest.TestCase):
         self.assertEqual(len(backend.plan_calls), 1)
 
     def test_strands_respects_max_subqueries(self):
+        # 4 subqueries returned, capped to 2 -> plan = [original, sq1, sq2].
         backend = FakeStrandsBackend(subqueries=["a b", "c d", "e f", "g h"])
         planner = QueryPlanner(max_subqueries=2, strands_backend=backend)
         plan = planner.create_plan("original query here")
-        self.assertLessEqual(len(plan), 2)
-        self.assertEqual(plan[0], "original query here")
+        self.assertEqual(plan, ["original query here", "a b", "c d"])
 
     def test_strands_dedup_and_non_string_filtered(self):
         backend = FakeStrandsBackend(subqueries=["the query", "the query", 123, "", "  ", "extra one"])

@@ -10,7 +10,7 @@ supports and reports, per hop count:
 
 * ``rule``    -- deterministic planner (regex split) + rule-based policy cascade.
 * ``llm``     -- raw-Bedrock LLM planner + policy (``use_llm_planner/policy``).
-* ``strands`` -- Strands/Bedrock-Haiku planner + policy (``use_strands_*``), where
+* ``strands`` -- Strands/Bedrock-Sonnet planner + policy (``use_strands_*``), where
                  the LLM emits only the plan/action and Python derives the args.
 
 Metrics (MuSiQue's official pair, plus supporting signals)
@@ -50,8 +50,9 @@ HuggingFace with ``--from-hf`` if no frozen file is present.
 
 Environment
 -----------
-Reuses ``local_example/local_config.yaml`` (MiniLM embeddings + Bedrock Claude
-Haiku). Source ``credential.sh`` for Bedrock access before running -- the ``llm``
+Reuses ``local_example/local_config.yaml`` (Bedrock Cohere Embed English v3
+embeddings + Bedrock Claude Sonnet 4.6). Source ``credential.sh`` for Bedrock
+access before running -- the ``llm``
 and ``strands`` backends make live Bedrock calls; ``rule`` does not. The global
 index is built in memory and never persisted.
 

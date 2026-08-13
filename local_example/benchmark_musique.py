@@ -47,8 +47,9 @@ row selection. Either way the loaded rows are merged into the global corpus.
 
 Environment note
 ----------------
-Reuses ``local_example/local_config.yaml`` (MiniLM embeddings + Bedrock Claude
-Haiku generator). Source ``credential.sh`` for Bedrock access before running. The
+Reuses ``local_example/local_config.yaml`` (Bedrock Cohere Embed English v3
+embeddings + Bedrock Claude Sonnet 4.6 generator). Source ``credential.sh`` for
+Bedrock access before running. The
 config's saved-index paths are NOT written to: this runner overrides the vector-DB
 save/load flags in memory so the global index never touches disk.
 """
@@ -77,7 +78,6 @@ from agrag.evaluation.retrieval_metrics import aggregate_retrieval_metrics, retr
 from agrag.evaluation.utils import calculate_f1_score, f1_metric, rouge_geometric_mean
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-os.chdir(REPO_ROOT)
 
 CONFIG = "local_example/local_config.yaml"
 DATASET = "dgslibisey/MuSiQue"
@@ -103,6 +103,27 @@ def load_rows(eval_set_path, from_hf, split, size, seed, stratify, answerable_on
     uses, so both routes evaluate comparable rows.
     """
     if not from_hf and os.path.exists(eval_set_path):
+        # The frozen file is evaluated as-is: its rows were already selected (size,
+        # seed, split, stratify) when it was built by build_musique_eval_set.py. So
+        # those flags cannot re-select here -- warn if the user passed non-defaults
+        # so the ignored flags are visible rather than silently dropped. Rebuild the
+        # frozen file or pass --from-hf to change the selection. (--answerable-only
+        # is still applied downstream in main, so it is not listed here.)
+        ignored = []
+        if size and size != 30:
+            ignored.append(f"--max-eval-size={size}")
+        if seed != DEFAULT_SEED:
+            ignored.append(f"--seed={seed}")
+        if split != DEFAULT_SPLIT:
+            ignored.append(f"--split={split}")
+        if stratify:
+            ignored.append("--stratify")
+        if ignored:
+            print(
+                f"WARNING: {', '.join(ignored)} ignored on the frozen path "
+                f"({eval_set_path}); these only take effect with --from-hf or by "
+                f"rebuilding the frozen file. Evaluating all frozen rows as-is."
+            )
         rows = []
         with open(eval_set_path, encoding="utf-8") as f:
             for line in f:
@@ -146,15 +167,27 @@ def _agentic_behavior_summary(agent_runs):
     avg_subqueries = sum(r["num_subqueries"] for r in agent_runs) / n
     avg_iterations = sum(r["iterations"] for r in agent_runs) / n
     multi_step = sum(1 for r in agent_runs if r["retrieval_calls"] > 1)
+    pct_multi_step = round(100.0 * multi_step / n, 1)
+    # Describe what actually happened rather than emitting a fixed caveat: a low
+    # pct_multi_step means the planner degenerated to single-shot (score parity
+    # with standard is then expected); a high one means it genuinely decomposed.
+    if pct_multi_step < 20.0:
+        note = (
+            f"pct_multi_step={pct_multi_step} is low: the planner mostly did NOT "
+            "decompose, so agentic ~= single-shot and score parity with standard "
+            "is expected."
+        )
+    else:
+        note = (
+            f"pct_multi_step={pct_multi_step}: the planner decomposed most queries "
+            "into multiple retrievals, so agentic is doing real multi-step work."
+        )
     return {
         "avg_retrieval_calls": round(avg_retrieval, 2),
         "avg_num_subqueries": round(avg_subqueries, 2),
         "avg_iterations": round(avg_iterations, 2),
-        "pct_multi_step": round(100.0 * multi_step / n, 1),
-        "note": (
-            "pct_multi_step near 0 means the planner did NOT decompose; "
-            "agentic ~= single-shot and score parity with standard is expected."
-        ),
+        "pct_multi_step": pct_multi_step,
+        "note": note,
     }
 
 
@@ -353,16 +386,62 @@ def _evidence_provenance(evidence):
     return provenance
 
 
-def run_mode(agrag, evaluator, rows, mode, jsonl_writer=None):
+def apply_rerank_setting(agrag, use_reranker, reranker_top_k=None):
+    """Reconfigure the already-built pipeline's reranker gate WITHOUT re-indexing.
+
+    ``use_reranker`` only gates the retriever's rerank stage; the vector index,
+    embeddings, and parent store are untouched. Re-initializing the retriever
+    module rebuilds it against the same in-memory ``vector_db_module`` (cheap --
+    no embedding or index work), and clearing the cached agentic module forces it
+    to rebuild against the new retriever on the next agentic query. When
+    ``reranker_top_k`` is given, the Reranker instance is rebuilt too (its truncation
+    cutoff is baked in at construction) so the sweep can vary how many chunks
+    survive reranking -- otherwise enabling reranking silently reintroduces the
+    truncate-to-reranker_top_k step and confounds the comparison with "fewer chunks
+    reached the generator".
+    """
+    agrag.args.use_reranker = use_reranker
+    if reranker_top_k is not None:
+        agrag.args.reranker_top_k = reranker_top_k
+        agrag.initialize_reranker_module()
+    agrag.initialize_retriever_module()
+    # The retriever was just rebuilt; re-attach the parent store (small-to-big
+    # expansion) and drop the cached agentic module so it rebinds to the new retriever.
+    agrag._attach_parent_store_to_retriever()
+    agrag.agentic_module = None
+    print(f"  reranking {'ON' if use_reranker else 'OFF'}" + (f" (top_k={reranker_top_k})" if reranker_top_k else ""))
+
+
+def rerank_variants(rerank_arg):
+    """Map the ``--rerank`` choice to an ordered list of ``(use_reranker, suffix)``.
+
+    ``config`` (default) leaves the pipeline exactly as the yaml configured it --
+    a single unsuffixed run, so behavior is unchanged when the flag is omitted.
+    ``on``/``off`` force a single setting; ``both`` runs the on and off settings
+    back to back so the two can be compared side by side in one results file.
+    """
+    if rerank_arg == "both":
+        return [(True, "_rerank_on"), (False, "_rerank_off")]
+    if rerank_arg == "on":
+        return [(True, "")]
+    if rerank_arg == "off":
+        return [(False, "")]
+    return [(None, "")]  # "config": no override
+
+
+def run_mode(agrag, evaluator, rows, mode, jsonl_writer=None, label=None):
     """Run one evaluation pass over the pre-selected rows.
 
     ``rows`` is the shared, reproducible list of MuSiQue rows used for BOTH modes
     (paired comparison). Every question is queried against the same global corpus,
     which was merged and indexed once before this call. ``jsonl_writer`` is an
-    optional callable receiving one dict per query, written as a JSONL row. Returns
-    overall + per-hop-type metrics plus the per-query latencies.
+    optional callable receiving one dict per query, written as a JSONL row.
+    ``label`` overrides the ``mode`` field written to the JSONL / printed header
+    (used to tag rerank-sweep variants, e.g. ``agentic_rerank_on``); ``mode`` itself
+    still drives ``generate_response``. Returns overall + per-hop-type metrics plus
+    the per-query latencies.
     """
-    label = mode or "standard"
+    label = label or (mode or "standard")
     print("\n" + "=" * 72)
     print(f"EVALUATING: {label.upper()} RAG on MuSiQue  (n={len(rows)})")
     print("=" * 72)
@@ -447,6 +526,11 @@ def run_mode(agrag, evaluator, rows, mode, jsonl_writer=None):
 
 
 def main():
+    # Run relative to the repo root so config/data paths resolve regardless of the
+    # caller's cwd. Done here (not at import time) so importing this module -- e.g.
+    # build_musique_eval_set.py reuses select_query_indices -- has no side effects.
+    os.chdir(REPO_ROOT)
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--eval-set",
@@ -480,10 +564,35 @@ def main():
         action="store_true",
         help="Stratified sampling by hop-count question type (default: first-N eligible rows in dataset order).",
     )
+    parser.add_argument(
+        "--rerank",
+        choices=["config", "on", "off", "both"],
+        default="config",
+        help=(
+            "Cross-encoder reranking sweep. 'config' (default): use whatever the yaml "
+            "sets (unchanged behavior). 'on'/'off': force one setting. 'both': run "
+            "reranking on AND off back to back and tag results (_rerank_on/_rerank_off) "
+            "for side-by-side comparison. No pipeline-code change; only the retriever's "
+            "use_reranker gate is toggled (no re-indexing)."
+        ),
+    )
+    parser.add_argument(
+        "--rerank-top-k",
+        type=int,
+        default=None,
+        help=(
+            "When reranking is enabled, override reranker_top_k (the truncation cutoff). "
+            "Vary this so the on/off comparison is not confounded by fewer chunks reaching "
+            "the generator. Defaults to the yaml value."
+        ),
+    )
     args = parser.parse_args()
 
     # Load the SAME rows for both modes (paired comparison). Frozen JSONL by
     # default (offline); HuggingFace only with --from-hf or if the file is absent.
+    # This condition mirrors load_rows' own branch so the recorded selection
+    # metadata below matches how the rows were actually chosen.
+    used_frozen = not args.from_hf and os.path.exists(args.eval_set)
     rows = load_rows(
         args.eval_set, args.from_hf, args.split, args.max_eval_size, args.seed, args.stratify, args.answerable_only
     )
@@ -514,6 +623,11 @@ def main():
     # takes effect while leaving configs/agent/default.yaml untouched.
     agrag.args.agent_use_llm_planner = True
     agrag.args.agent_use_llm_policy = True
+    # Sequential-hop execution: resolve subqueries in order, threading each hop's
+    # resolved answer into the next hop's retrieval query. Targets the dominant
+    # decomposition-failure bucket (late hops retrieved blind). Set here (not in the
+    # yaml) so configs/agent/default.yaml stays at its opt-out default.
+    agrag.args.agent_use_iterative_planner = True
     if not agrag.pipeline_initialized:
         agrag.initialize_rag_pipeline()
 
@@ -522,29 +636,43 @@ def main():
     os.makedirs(args.evaluation_dir, exist_ok=True)
     jsonl_path = os.path.join(args.evaluation_dir, "benchmark_predictions.jsonl")
 
+    # Reranking sweep: one pass per (use_reranker) variant. "config" (default) is a
+    # single pass that leaves the yaml setting alone, so omitting --rerank keeps the
+    # original two-bucket (standard/agentic) behavior byte-for-byte.
+    variants = rerank_variants(args.rerank)
     results = {}
     with open(jsonl_path, "w") as jf:
         def jsonl_writer(row):
             jf.write(json.dumps(row, default=str) + "\n")
 
-        results["standard"] = run_mode(
-            agrag, evaluator, rows, mode=None, jsonl_writer=jsonl_writer,
-        )
-        results["agentic"] = run_mode(
-            agrag, evaluator, rows, mode="agentic", jsonl_writer=jsonl_writer,
-        )
+        for use_reranker, suffix in variants:
+            if use_reranker is not None:
+                print(f"\n### Rerank variant: use_reranker={use_reranker} ###")
+                apply_rerank_setting(agrag, use_reranker, args.rerank_top_k)
+            for mode, base in ((None, "standard"), ("agentic", "agentic")):
+                label = base + suffix
+                results[label] = run_mode(
+                    agrag, evaluator, rows, mode=mode, jsonl_writer=jsonl_writer, label=label,
+                )
     print(f"\nSaved per-query predictions to {jsonl_path}")
 
+    # On the frozen path, size/seed/split/stratify did NOT drive selection (the
+    # rows were selected when the frozen file was built), so record them as null to
+    # avoid implying they applied. --answerable-only IS applied on both paths above,
+    # so it is reported as-is.
     results["selection"] = {
         "dataset": DATASET,
-        "eval_set": None if args.from_hf else args.eval_set,
+        "selection_source": "frozen" if used_frozen else "huggingface",
+        "eval_set": args.eval_set if used_frozen else None,
         "from_hf": args.from_hf,
-        "split": args.split,
-        "seed": args.seed,
+        "split": None if used_frozen else args.split,
+        "seed": None if used_frozen else args.seed,
         "answerable_only": args.answerable_only,
-        "stratify": args.stratify,
+        "stratify": None if used_frozen else args.stratify,
         "num_selected": len(rows),
         "source_indices": [r.get("_source_index") for r in rows],
+        "rerank_sweep": args.rerank,
+        "rerank_top_k_override": args.rerank_top_k,
     }
 
     print("\n" + "=" * 72)

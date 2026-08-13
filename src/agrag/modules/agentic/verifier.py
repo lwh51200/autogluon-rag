@@ -42,11 +42,21 @@ _ACCEPTABLE_LABELS = frozenset(
 )
 
 _VERIFY_INSTRUCTION = (
-    "You are a strict verifier. Given a QUESTION, a draft ANSWER, and the "
+    "You are a fair-minded verifier. Given a QUESTION, a draft ANSWER, and the "
     "EVIDENCE used to produce it, decide how well the evidence supports the "
-    "answer. Reply with exactly one of these labels and nothing else: "
-    "supported, partially_supported, unsupported, conflicting_evidence, "
-    "insufficient_evidence.\n\n"
+    "answer. This is often a multi-hop question: the answer is correct when its "
+    "conclusion reasonably follows from combining facts across the evidence, "
+    "even if no single passage states it verbatim and even if some intermediate "
+    "steps are implicit. Do not demand exact wording.\n\n"
+    "Reply with exactly one of these labels and nothing else:\n"
+    "- supported: the evidence, taken together, entails the answer.\n"
+    "- partially_supported: the evidence backs the core of the answer but some "
+    "detail is missing or only weakly grounded. Prefer this over rejecting when "
+    "the answer is plausibly grounded.\n"
+    "- unsupported: the evidence does not back the answer at all.\n"
+    "- conflicting_evidence: the evidence directly contradicts the answer.\n"
+    "- insufficient_evidence: there is essentially no relevant evidence for the "
+    "question.\n\n"
 )
 
 
@@ -75,7 +85,14 @@ class AnswerVerifier:
 
     @staticmethod
     def _parse_label(text: str) -> VerificationLabel:
-        """Map raw model output to a label; default to unsupported if unclear."""
+        """Map raw model output to a label; default to unsupported if unclear.
+
+        A reply with no recognizable label token is treated as a rejection: a
+        parse miss is not evidence of support, so defaulting to ``unsupported``
+        keeps the verifier honest. Callers that must always return an answer use
+        the executor's ``always_answer`` mode, which returns the draft regardless
+        of this label rather than relaxing what the verifier reports.
+        """
         lowered = (text or "").strip().lower()
         for label in _LABELS_BY_LENGTH:
             if label.value in lowered:

@@ -32,7 +32,7 @@ class GeneratorModule:
 
     def __init__(
         self,
-        model_name: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        model_name: str = "us.anthropic.claude-sonnet-4-6",
         model_platform: str = "bedrock",
         platform_args: dict = {},
         **kwargs,

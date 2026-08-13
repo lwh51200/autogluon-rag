@@ -1,6 +1,7 @@
 import unittest
 
 from agrag.evaluation.retrieval_metrics import (
+    _gold_units,
     aggregate_retrieval_metrics,
     fact_is_retrieved,
     retrieval_metrics_for_query,
@@ -20,6 +21,48 @@ class TestFactIsRetrieved(unittest.TestCase):
 
     def test_empty_fact_never_matches(self):
         self.assertFalse(fact_is_retrieved("the and of", "anything at all", threshold=0.6))
+
+
+class TestSentenceLevelGoldMatching(unittest.TestCase):
+    def test_long_paragraph_matches_via_single_sentence(self):
+        # A multi-sentence gold "fact" (paragraph). Only the second sentence is in
+        # the retrieved chunk. Whole-paragraph containment would fall well under
+        # 0.6 (the chunk holds a minority of the paragraph's tokens), but
+        # sentence-level matching counts the fact as retrieved.
+        fact = (
+            "The company was founded in a small garage and grew steadily over many "
+            "decades into a global enterprise employing thousands of people worldwide. "
+            "Its headquarters relocated to the city of Portland in 1994. "
+            "The founder later stepped down and pursued philanthropic ventures across "
+            "several continents for the remainder of his career."
+        )
+        chunk = "Its headquarters relocated to the city of Portland in 1994."
+        # Sanity: the chunk is far shorter than the paragraph, so paragraph-level
+        # containment cannot clear the bar, but the sentence does.
+        self.assertTrue(fact_is_retrieved(fact, chunk, threshold=0.6))
+
+    def test_single_sentence_fact_unchanged(self):
+        # A short single-sentence fact yields exactly one unit -> same as before.
+        fact = "the electric car company reported record deliveries"
+        chunk = "In its update, the electric car company reported record deliveries this quarter."
+        self.assertTrue(fact_is_retrieved(fact, chunk, threshold=0.6))
+        self.assertEqual(len(_gold_units(fact)), 1)
+
+    def test_unrelated_chunk_still_does_not_match(self):
+        # Splitting into sentences must not create spurious matches.
+        fact = (
+            "The treaty was signed in the spring of that year. "
+            "Delegates from a dozen nations attended the ceremony."
+        )
+        chunk = "the weather forecast predicts rain over the weekend"
+        self.assertFalse(fact_is_retrieved(fact, chunk, threshold=0.6))
+
+    def test_gold_units_splits_sentences(self):
+        fact = "First sentence here. Second sentence follows! Third one ends?"
+        self.assertEqual(len(_gold_units(fact)), 3)
+
+    def test_gold_units_bare_phrase_is_single_unit(self):
+        self.assertEqual(_gold_units("Portland Oregon"), ["Portland Oregon"])
 
 
 class TestRetrievalMetricsForQuery(unittest.TestCase):

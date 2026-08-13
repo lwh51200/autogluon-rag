@@ -7,7 +7,7 @@ wiring regressions that unit tests with fakes cannot, e.g. a retriever/evidence
 contract drift or a loop-budget default that abstains before it can recover.
 
 It reuses the committed ``local_example`` corpus, its prebuilt FAISS index, and
-its config (all-MiniLM-L6-v2 embeddings + a Bedrock Claude Haiku 4.5 generator),
+its config (Bedrock Cohere Embed English v3 embeddings + a Bedrock Claude Sonnet 4.6 generator),
 so nothing is re-embedded or written. The test asserts the *plumbing* (retrieval
 finds real evidence, the loop terminates with a valid status, a coherent trace is
 produced) rather than exact answer text.

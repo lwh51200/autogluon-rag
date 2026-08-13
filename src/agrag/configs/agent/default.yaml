@@ -11,6 +11,16 @@ AGENT_MAX_CONTEXT_TOKENS: 6000
 AGENT_USE_QUERY_REWRITE: true
 AGENT_USE_CONTEXT_COMPRESSION: false
 AGENT_USE_VERIFICATION: true
+# Never-refuse is the default (AGENT_ALLOW_ABSTENTION: false). On weak/failed
+# verification the agent iterates (rewrite + retrieve more); when iteration is
+# exhausted it returns a best-effort, evidence-grounded answer instead of the
+# canned abstention. Verification still runs and steers those rewrites. Set true
+# to restore the ability to refuse (abstain) when a question is unanswerable.
+AGENT_ALLOW_ABSTENTION: false
+# Maximum query rewrites per run. Only a rewrite (a new query) surfaces new
+# evidence -- re-retrieving the same query is deduped away -- so this is the main
+# lever on how hard the agent iterates for evidence before drafting a best effort.
+AGENT_MAX_REWRITES: 2
 AGENT_MIN_EVIDENCE_COUNT: 2
 # Minimum fraction of planned subqueries that must have supporting evidence before
 # drafting is the preferred action. When coverage is below this (and a rewrite is
@@ -31,14 +41,14 @@ AGENT_USE_LLM_PLANNER: false
 # deterministically). The LLM is consulted only at genuine forks, not every
 # iteration. Off by default.
 AGENT_USE_LLM_POLICY: false
-# When true, the QueryPlanner uses a Strands agent (Bedrock Haiku 4.5) to emit
+# When true, the QueryPlanner uses a Strands agent (Bedrock Sonnet 4.6) to emit
 # retrieval subqueries as Pydantic-validated structured output, instead of the
 # raw-generator LLM path or the regex split. Takes precedence over
 # AGENT_USE_LLM_PLANNER when both are set. Requires the optional `strands-agents`
 # dependency; if it or Bedrock is unavailable the planner falls back to the LLM
 # path then the rule-based split. Off by default.
 AGENT_USE_STRANDS_PLANNER: false
-# When true, the DecisionPolicy uses a Strands agent (Bedrock Haiku 4.5) to
+# When true, the DecisionPolicy uses a Strands agent (Bedrock Sonnet 4.6) to
 # choose the next action from the currently-legal set, constrained to that set by
 # a JSON-schema enum (args are still assembled deterministically). Takes
 # precedence over AGENT_USE_LLM_POLICY at forks. Requires `strands-agents`; falls
@@ -57,3 +67,13 @@ AGENT_USE_STRANDS_POLICY: false
 # Off by default so the standard agentic behavior (and its evidence counts) is
 # unchanged.
 AGENT_USE_FUSED_RETRIEVAL: false
+# When true, the executor resolves the plan's subqueries SEQUENTIALLY instead of
+# retrieving them all in one up-front parallel MULTI_RETRIEVE. Per hop it builds a
+# self-contained query (substituting prior hops' resolved answers into pronouns /
+# vague references via the shared generator), retrieves, ingests evidence, and
+# extracts that hop's intermediate answer to thread into the next hop; the final
+# answer is synthesized + verified against the original question exactly as before.
+# This targets multi-hop questions whose later hops depend on an earlier hop's
+# answer. Only engages when the plan produced >=2 subqueries; otherwise the
+# standard loop runs unchanged. Off by default (pure opt-in, no behavior change).
+AGENT_USE_ITERATIVE_PLANNER: false

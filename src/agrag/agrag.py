@@ -478,6 +478,8 @@ class AutoGluonRAG:
             "use_query_rewrite": self.args.agent_use_query_rewrite,
             "use_context_compression": self.args.agent_use_context_compression,
             "use_verification": self.args.agent_use_verification,
+            "allow_abstention": self.args.agent_allow_abstention,
+            "max_rewrites": self.args.agent_max_rewrites,
             "min_evidence_count": self.args.agent_min_evidence_count,
             "min_subgoal_coverage": self.args.agent_min_subgoal_coverage,
             "min_relevance": self.args.agent_min_relevance,
@@ -487,6 +489,7 @@ class AutoGluonRAG:
             "use_llm_policy": self.args.agent_use_llm_policy,
             "use_strands_planner": self.args.agent_use_strands_planner,
             "use_strands_policy": self.args.agent_use_strands_policy,
+            "use_iterative_planner": self.args.agent_use_iterative_planner,
             # Share the standard-path query prefix so answer formatting is
             # consistent across standard and agentic modes.
             "query_prefix": self.args.generator_query_prefix,
@@ -675,7 +678,6 @@ class AutoGluonRAG:
             batch_file_paths = file_paths[i : i + self.batch_size]
             batch_urls = web_urls[i : i + self.batch_size]
 
-            # Data Processing
             processed_files_data, last_doc_id = self.data_processing_module.process_files(
                 batch_file_paths, start_doc_id=start_doc_id
             )
@@ -693,13 +695,10 @@ class AutoGluonRAG:
                 processed_data = self.data_processing_module.build_parent_child(processed_data)
                 self.parent_store = self.data_processing_module.parent_store
 
-            # Embedding
             embeddings = self.generate_embeddings(processed_data)
 
-            # Vector DB
             self.construct_vector_db(embeddings)
 
-            # Clear memory
             del processed_data
             del embeddings
 

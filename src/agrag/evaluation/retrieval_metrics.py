@@ -17,6 +17,18 @@ content tokens appear in that chunk -- token *containment* above a threshold
 (default 0.6). This is deliberately lenient on chunk boundaries but strict on
 content, which is the right trade-off for chunked retrieval.
 
+Sentence-level gold units
+-------------------------
+MuSiQue's gold "facts" are frequently whole *paragraphs*, not single sentences.
+A 294-token gold paragraph can never place 60% of its content tokens inside a
+single ~131-token chunk, so paragraph-level containment structurally under-counts
+long facts -- the supporting sentence is retrieved, yet the fact scores as a miss.
+To fix that lower bound, each gold fact is split into sentence *units* and the
+fact is counted as retrieved when *any* one of its sentences clears the
+containment bar against a retrieved chunk. A sentence fits in a chunk; a
+paragraph does not. A fact with no sentence boundary is treated as a single unit,
+so short single-sentence facts behave exactly as before.
+
 The metrics are corpus-agnostic: they take the ranked list of retrieved chunk
 texts and the list of gold fact strings, so they work for any benchmark that
 provides gold evidence snippets, not just MultiHop-RAG.
@@ -77,25 +89,60 @@ _STOPWORDS = {
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
+# Sentence boundary: terminal punctuation (. ! ?) followed by whitespace. Kept
+# deliberately simple (stdlib regex, no NLP dependency) -- over-splitting is
+# harmless here because each unit is matched independently and the fact counts as
+# retrieved if ANY unit clears the bar.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
 
 def _content_tokens(text: str) -> List[str]:
     """Lowercase, split to alphanumeric tokens, drop stopwords."""
     return [tok for tok in _TOKEN_RE.findall(text.lower()) if tok not in _STOPWORDS]
 
 
-def fact_is_retrieved(fact: str, chunk_text: str, threshold: float = 0.6) -> bool:
-    """True if ``chunk_text`` contains enough of ``fact``'s content tokens.
+def _gold_units(fact: str) -> List[str]:
+    """Split a gold fact into sentence units for containment matching.
 
-    Containment = (# of fact content-tokens present in the chunk's token set) /
-    (# of fact content-tokens). Uses set membership so repetition does not skew
-    the ratio. A fact with no content tokens can never be matched (returns False).
+    MuSiQue gold facts are often multi-sentence paragraphs too long to fit the
+    60% containment bar inside a single chunk. Splitting into sentences lets a
+    fact count as retrieved when any one supporting sentence is present. A fact
+    with a single sentence (or none) yields one unit -- identical to the previous
+    whole-fact behavior. Units with no content tokens are dropped.
     """
-    fact_tokens = _content_tokens(fact)
-    if not fact_tokens:
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(fact) if p and p.strip()]
+    units = [p for p in parts if _content_tokens(p)]
+    if units:
+        return units
+    # No usable sentence split (e.g. a bare phrase): fall back to the whole fact.
+    return [fact] if _content_tokens(fact) else []
+
+
+def _unit_is_retrieved(unit: str, chunk_text: str, threshold: float) -> bool:
+    """True if ``chunk_text`` contains enough of a single gold ``unit``'s tokens.
+
+    Containment = (# of unit content-tokens present in the chunk's token set) /
+    (# of unit content-tokens). Uses set membership so repetition does not skew
+    the ratio. A unit with no content tokens can never be matched (returns False).
+    """
+    unit_tokens = _content_tokens(unit)
+    if not unit_tokens:
         return False
     chunk_tokens = set(_content_tokens(chunk_text))
-    present = sum(1 for tok in set(fact_tokens) if tok in chunk_tokens)
-    return (present / len(set(fact_tokens))) >= threshold
+    present = sum(1 for tok in set(unit_tokens) if tok in chunk_tokens)
+    return (present / len(set(unit_tokens))) >= threshold
+
+
+def fact_is_retrieved(fact: str, chunk_text: str, threshold: float = 0.6) -> bool:
+    """True if ``chunk_text`` contains enough of ANY of ``fact``'s sentence units.
+
+    The fact is split into sentence units (``_gold_units``); it counts as
+    retrieved when any single unit clears the containment threshold against the
+    chunk. This keeps chunk-boundary leniency while no longer penalizing long
+    multi-sentence gold paragraphs that cannot fit a chunk in full. A fact with no
+    content tokens can never be matched (returns False).
+    """
+    return any(_unit_is_retrieved(unit, chunk_text, threshold) for unit in _gold_units(fact))
 
 
 def _first_hit_rank(retrieved_texts: List[str], gold_facts: List[str], threshold: float) -> int:

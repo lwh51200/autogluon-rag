@@ -11,13 +11,14 @@ Three modes are supported, in precedence order Strands > LLM > rule-based:
 * **LLM-backed** (opt-in via ``use_llm`` + a ``generator_module``): the query is
   decomposed by the configured generator (the same shared LLM used elsewhere in
   the agentic path). The model's output is parsed and *validated* back into the
-  same ``List[str]`` contract — original query first, deduped, capped at
-  ``max_subqueries`` — and any malformed output falls back to the rule-based plan.
+  same ``List[str]`` contract — original query first, deduped, with at most
+  ``max_subqueries`` subqueries appended after it — and any malformed output falls
+  back to the rule-based plan.
   There is no pydantic dependency; validation is stdlib JSON + type checks, in
   the same "constrained output + tolerant parse + safe fallback" spirit as
   ``AnswerVerifier``.
 * **Strands-backed** (opt-in via a ``strands_backend``): the query is decomposed
-  by a Strands agent driving Bedrock Haiku 4.5, which returns *only* subquery
+  by a Strands agent driving Bedrock Sonnet 4.6, which returns *only* subquery
   strings (Pydantic-validated structured output). Those strings go through the
   same normalization as the LLM path, so the ``List[str]`` contract is identical.
   Any failure falls back to the LLM path (if configured) and then to rules.
@@ -62,8 +63,9 @@ class QueryPlanner:
     Attributes:
     ----------
     max_subqueries : int
-        Upper bound on the number of subqueries produced (the original query
-        counts as the first entry).
+        Upper bound on the number of subqueries produced *beyond* the original
+        query. The original query is always the first plan entry and does not count
+        against this bound, so a plan holds up to ``max_subqueries + 1`` entries.
     generator_module : Optional[GeneratorModule]
         The shared generator used when ``use_llm`` is enabled. When ``None`` the
         planner is always rule-based regardless of ``use_llm``.
@@ -126,9 +128,10 @@ class QueryPlanner:
     def _rule_based_plan(self, query: str) -> List[str]:
         """Derive subqueries by splitting on conjunctions / punctuation.
 
-        The original query is always included first. If the query appears to
-        bundle multiple information needs (e.g. contains "and", "versus", "?"),
-        the parts are added as additional subqueries, up to ``max_subqueries``.
+        The original query is always included first and does NOT count against the
+        cap. If the query appears to bundle multiple information needs (e.g.
+        contains "and", "versus", "?"), the parts are added as additional
+        subqueries, up to ``max_subqueries`` subqueries beyond the original.
         """
         query = query.strip()
         plan: List[str] = [query] if query else []
@@ -140,11 +143,14 @@ class QueryPlanner:
         meaningful = [p for p in parts if len(p.split()) >= 2]
         if len(meaningful) > 1:
             for part in meaningful:
+                # Cap the number of *subqueries* (entries beyond the original),
+                # not the whole plan, so the original never consumes a slot.
+                if len(plan) - 1 >= self.max_subqueries:
+                    break
                 if part not in plan:
                     plan.append(part)
 
-        plan = plan[: self.max_subqueries]
-        logger.debug("Rule-based planner produced %d subqueries for %r", len(plan), query)
+        logger.debug("Rule-based planner produced %d subqueries for %r", len(plan) - 1, query)
         return plan
 
     def _llm_plan(self, query: str) -> Optional[List[str]]:
@@ -200,18 +206,24 @@ class QueryPlanner:
     def _normalize_subqueries(self, subqueries: List, original_query: str) -> Optional[List[str]]:
         """Normalize raw model subqueries into the executor's ``List[str]`` contract.
 
-        The plan always leads with the original query; only non-empty string
-        subqueries not already present are appended, capped at ``max_subqueries``.
-        Shared by the LLM and Strands paths so both yield identical shapes.
-        Returns ``None`` when nothing usable remains so the caller falls back.
+        The plan always leads with the original query, which does NOT count against
+        the cap; only non-empty string subqueries not already present are appended,
+        capped at ``max_subqueries`` *subqueries* (so the plan holds up to
+        ``max_subqueries + 1`` entries). This matches the prompts, which tell the
+        model to return "at most ``max_subqueries`` subqueries". Shared by the LLM
+        and Strands paths so both yield identical shapes. Returns ``None`` when
+        nothing usable remains so the caller falls back.
         """
-        plan: List[str] = [original_query.strip()] if original_query.strip() else []
+        original = original_query.strip()
+        plan: List[str] = [original] if original else []
         for item in subqueries:
+            # Cap the number of *subqueries* (entries beyond the original).
+            if len(plan) - (1 if original else 0) >= self.max_subqueries:
+                break
             if not isinstance(item, str):
                 continue
             cleaned = item.strip()
             if cleaned and cleaned not in plan:
                 plan.append(cleaned)
 
-        plan = plan[: self.max_subqueries]
         return plan or None

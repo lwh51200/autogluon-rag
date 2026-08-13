@@ -116,7 +116,7 @@ agent:
   return_trace: false       # return (answer, trace) instead of just answer
 ```
 
-A runnable example over local documents lives in `local_example/`. It uses HuggingFace embeddings + reranker on CPU and an AWS Bedrock Claude Haiku 4.5 generator by default (credentials via the standard AWS chain); swap the generator in `local_example/local_config.yaml` for a local HuggingFace model to run without cloud credentials.
+A runnable example over local documents lives in `local_example/`. It uses AWS Bedrock Cohere Embed English v3 embeddings, a HuggingFace reranker on CPU, and an AWS Bedrock Claude Sonnet 4.6 generator by default (credentials via the standard AWS chain); swap the generator in `local_example/local_config.yaml` for a local HuggingFace model to run without cloud credentials.
 
 For a list of configurable parameters that can be passed into the `AutoGluonRAG` class, refer to the tutorial [here](https://github.com/autogluon/autogluon-rag/tree/main/docs/tutorials/general/code_parameters.md). 
 

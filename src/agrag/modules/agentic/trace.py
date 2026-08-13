@@ -35,6 +35,9 @@ class AgentTrace:
         Retrieval queries produced by the planner.
     subqueries : List[str]
         Subqueries used for multi-query retrieval.
+    hop_answers : List[Dict[str, str]]
+        Resolved intermediate-answer chain from the sequential-hop executor (empty
+        on the parallel path); each entry is ``{"subquery", "hop_query", "answer"}``.
     steps : List[Dict[str, Any]]
         Ordered (action, observation) records from ``AgentState.history``.
     evidence : List[Dict[str, Any]]
@@ -50,6 +53,7 @@ class AgentTrace:
     verification: Optional[Dict[str, Any]] = None
     plan: List[str] = field(default_factory=list)
     subqueries: List[str] = field(default_factory=list)
+    hop_answers: List[Dict[str, str]] = field(default_factory=list)
     steps: List[Dict[str, Any]] = field(default_factory=list)
     evidence: List[Dict[str, Any]] = field(default_factory=list)
     metrics: Dict[str, Any] = field(default_factory=dict)
@@ -106,6 +110,7 @@ class AgentTrace:
             verification=state.last_verification or state.verification,
             plan=list(state.plan),
             subqueries=list(state.subqueries),
+            hop_answers=[dict(h) for h in state.hop_answers],
             steps=[record.to_dict() for record in state.history],
             evidence=evidence_store.to_list(),
             metrics=metrics,

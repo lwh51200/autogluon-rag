@@ -59,12 +59,28 @@ class TestAgenticRAGModule(unittest.TestCase):
         self.assertGreaterEqual(trace["metrics"]["evidence_count"], 2)
         self.assertGreaterEqual(trace["metrics"]["retrieval_calls"], 1)
 
-    def test_abstains_when_no_evidence(self):
+    def test_abstains_when_no_evidence_and_abstention_allowed(self):
+        # Refuse path (opt-in): with allow_abstention=True and no evidence, the
+        # agent returns the canned abstention.
         retriever = FakeRetriever([])  # never returns evidence
         gen = FakeGenerator()
-        module = AgenticRAGModule(retriever, gen, config={"min_evidence_count": 2, "use_query_rewrite": False})
+        module = AgenticRAGModule(
+            retriever,
+            gen,
+            config={"min_evidence_count": 2, "use_query_rewrite": False, "allow_abstention": True},
+        )
         answer = module.answer("q")
         self.assertEqual(answer, DEFAULT_ABSTENTION)
+
+    def test_never_refuses_when_no_evidence_by_default(self):
+        # Default (never-refuse): even with no evidence retrieved, the agent
+        # synthesizes a best-effort answer rather than the canned abstention.
+        retriever = FakeRetriever([])  # never returns evidence
+        gen = FakeGenerator(answer="best effort")
+        module = AgenticRAGModule(retriever, gen, config={"min_evidence_count": 2, "use_query_rewrite": False})
+        answer = module.answer("q")
+        self.assertEqual(answer, "best effort")
+        self.assertNotEqual(answer, DEFAULT_ABSTENTION)
 
     def test_loop_respects_max_iterations(self):
         # Evidence always insufficient, rewrite enabled: must still terminate.
@@ -77,7 +93,10 @@ class TestAgenticRAGModule(unittest.TestCase):
         )
         answer, trace = module.answer("q", return_trace=True)
         self.assertLessEqual(trace["metrics"]["iterations"], 3)
-        self.assertIn(trace["status"], ("abstained", "max_iterations"))
+        # The loop must terminate within budget. Under the never-refuse default a
+        # forced-abstain terminal returns a best-effort answer (status "answered");
+        # "max_iterations" is also acceptable if the cap is hit first.
+        self.assertIn(trace["status"], ("answered", "abstained", "max_iterations"))
 
     def test_verification_disabled_accepts_draft(self):
         retriever = FakeRetriever(_records(3))
@@ -87,18 +106,40 @@ class TestAgenticRAGModule(unittest.TestCase):
         self.assertEqual(answer, "unverified answer")
         self.assertEqual(trace["verification"]["label"], "unverified")
 
-    def test_unsupported_then_exhausts_and_abstains(self):
-        # Enough evidence to draft, but verifier always says unsupported.
+    def test_unsupported_then_exhausts_and_abstains_when_allowed(self):
+        # Refuse path (opt-in): enough evidence to draft, but the verifier always
+        # says unsupported. With allow_abstention=True an unaccepted draft is not
+        # returned: the agent abstains via max iterations.
         retriever = FakeRetriever(_records(3))
-        gen = FakeGenerator(verify_label="unsupported")
+        gen = FakeGenerator(answer="the answer", verify_label="unsupported")
+        module = AgenticRAGModule(
+            retriever,
+            gen,
+            config={
+                "min_evidence_count": 2,
+                "max_iterations": 3,
+                "use_query_rewrite": False,
+                "allow_abstention": True,
+            },
+        )
+        answer = module.answer("q")
+        # Never accepted -> abstains via max iterations.
+        self.assertEqual(answer, DEFAULT_ABSTENTION)
+
+    def test_returns_best_draft_instead_of_abstaining_by_default(self):
+        # Default (never-refuse): same setup, but the agent must never emit the
+        # canned abstention. It returns its best (verifier-rejected) draft.
+        retriever = FakeRetriever(_records(3))
+        gen = FakeGenerator(answer="the answer", verify_label="unsupported")
         module = AgenticRAGModule(
             retriever,
             gen,
             config={"min_evidence_count": 2, "max_iterations": 3, "use_query_rewrite": False},
         )
-        answer = module.answer("q")
-        # Never accepted -> abstains via max iterations.
-        self.assertEqual(answer, DEFAULT_ABSTENTION)
+        answer, trace = module.answer("q", return_trace=True)
+        self.assertEqual(answer, "the answer")
+        self.assertNotEqual(answer, DEFAULT_ABSTENTION)
+        self.assertEqual(trace["status"], "answered")
 
     def test_retrieve_top_k_per_query_reaches_retriever(self):
         retriever = FakeRetriever(_records(3))
@@ -218,10 +259,11 @@ class TestAgentAdaptation(unittest.TestCase):
         self.assertEqual(actions.count("draft_answer"), 2)
 
     def test_no_wasted_rewrite_on_final_iteration(self):
-        # With a budget too small to act on a rewrite, the agent must abstain
-        # directly instead of spending its last iteration on a rewrite whose
-        # re-retrieval/re-draft can never run. max_iterations=2 leaves no room:
-        # iteration 0 drafts, iteration 1 has nothing to gain from rewriting.
+        # With a budget too small to act on a rewrite, the agent must not spend its
+        # last iteration on a rewrite whose re-retrieval/re-draft can never run.
+        # max_iterations=2 leaves no room: iteration 0 drafts, iteration 1 has
+        # nothing to gain from rewriting. Under the never-refuse default the best
+        # (verifier-rejected) draft is returned rather than the canned abstention.
         retriever = ScriptedRetriever(
             {}, default=[{"text": f"c{i}", "doc_id": 0, "chunk_id": i} for i in range(3)]
         )
@@ -231,23 +273,36 @@ class TestAgentAdaptation(unittest.TestCase):
         )
         answer, trace = module.answer("q", return_trace=True)
         actions = [s["action_type"] for s in trace["steps"]]
-        self.assertEqual(answer, DEFAULT_ABSTENTION)
+        self.assertEqual(answer, gen.answer)
+        self.assertNotEqual(answer, DEFAULT_ABSTENTION)
         # No rewrite was issued because it could never be acted upon.
         self.assertNotIn("rewrite_query", actions)
 
     def test_no_infinite_redraft_when_verification_always_fails(self):
-        # Verifier never accepts; with a single rewrite budget the agent must
-        # abstain rather than re-draft the identical answer every iteration.
+        # Verifier never accepts and the rewritten query returns only duplicate
+        # (already-seen) evidence, so no NEW evidence ever arrives after a draft.
+        # The re-draft path is gated on new evidence, so the agent must not
+        # re-draft the identical answer every iteration: at most one draft per
+        # distinct query (original + one rewrite, with max_rewrites=1). Under the
+        # never-refuse default it then returns the best draft rather than abstaining.
         retriever = ScriptedRetriever(
             {}, default=[{"text": f"c{i}", "doc_id": 0, "chunk_id": i} for i in range(3)]
         )
         gen = ScriptedGenerator(verify_labels=["unsupported", "unsupported", "unsupported"])
         module = AgenticRAGModule(
-            retriever, gen, config={"min_evidence_count": 2, "use_query_rewrite": True, "max_iterations": 6}
+            retriever,
+            gen,
+            config={
+                "min_evidence_count": 2,
+                "use_query_rewrite": True,
+                "max_iterations": 6,
+                "max_rewrites": 1,
+            },
         )
         answer, trace = module.answer("q", return_trace=True)
         actions = [s["action_type"] for s in trace["steps"]]
-        self.assertEqual(answer, DEFAULT_ABSTENTION)
+        self.assertEqual(answer, gen.answer)
+        self.assertNotEqual(answer, DEFAULT_ABSTENTION)
         # At most one draft per distinct query (original + one rewrite).
         self.assertLessEqual(actions.count("draft_answer"), 2)
 
@@ -275,6 +330,116 @@ class TestAgentAdaptation(unittest.TestCase):
         # Compression runs before the draft.
         self.assertLess(actions.index("compress_context"), actions.index("draft_answer"))
         self.assertEqual(trace["status"], "answered")
+
+
+class SequentialGenerator:
+    """Generator fake for the sequential-hop path.
+
+    Distinguishes the four prompt kinds the sequential executor produces:
+    * LLM planner  -> returns a JSON decomposition ("subqueries" list).
+    * Hop fill-in  -> returns a scripted self-contained rewrite.
+    * Verifier     -> returns "supported".
+    * Answer synth -> returns a per-hop / final answer keyed off the question text.
+    """
+
+    def __init__(self, plan_subqueries, hop_fill="Which county is Springfield in?", answers=None):
+        self.plan_subqueries = plan_subqueries
+        self.hop_fill = hop_fill
+        self.answers = answers or {}
+        self.model_name = "mistral-7b"
+        self.prompts = []
+
+    def generate_response(self, prompt):
+        self.prompts.append(prompt)
+        low = prompt.lower()
+        if "decompose" in low and "subqueries" in low:
+            import json
+
+            return json.dumps({"subqueries": self.plan_subqueries})
+        if "self-contained" in low or "rewritten self-contained query" in low:
+            return self.hop_fill
+        if "verifier" in low:
+            return "supported"
+        # Answer synthesis: return a scripted answer if the question text matches a
+        # key, else a generic answer.
+        for key, val in self.answers.items():
+            if key.lower() in low:
+                return val
+        return "final answer"
+
+
+class TestSequentialHopExecutor(unittest.TestCase):
+    """Fix 1: the opt-in sequential-hop executor threads each hop's resolved
+    answer into the next hop's retrieval query."""
+
+    def _module(self, retriever, gen, **overrides):
+        config = {
+            "min_evidence_count": 1,
+            "use_llm_planner": True,
+            "use_iterative_planner": True,
+            "max_iterations": 8,
+        }
+        config.update(overrides)
+        return AgenticRAGModule(retriever, gen, config=config)
+
+    def test_sequential_path_records_hop_answers(self):
+        retriever = ScriptedRetriever({}, default=_records(2))
+        gen = SequentialGenerator(
+            plan_subqueries=["Where is Springfield?", "Which county is it in?"],
+            answers={"where is springfield": "Illinois"},
+        )
+        _, trace = self._module(retriever, gen).answer(
+            "What county is Springfield in?", return_trace=True
+        )
+        # Two hops resolved and recorded in the chain.
+        self.assertEqual(len(trace["hop_answers"]), 2)
+        self.assertEqual(trace["hop_answers"][0]["subquery"], "Where is Springfield?")
+        self.assertEqual(trace["status"], "answered")
+
+    def test_unresolved_reference_is_filled_before_retrieval(self):
+        # The second subquery contains "it" (an unresolved reference), so it must be
+        # rewritten via the fill-in prompt before it reaches the retriever.
+        retriever = ScriptedRetriever({}, default=_records(2))
+        gen = SequentialGenerator(
+            plan_subqueries=["Where is Springfield?", "Which county is it in?"],
+            hop_fill="Which county is Springfield in?",
+        )
+        self._module(retriever, gen).answer("What county is Springfield in?")
+        # The resolved (filled-in) query reached the retriever, not the raw "it" one.
+        self.assertIn("Which county is Springfield in?", retriever.queries)
+        self.assertNotIn("Which county is it in?", retriever.queries)
+
+    def test_uses_retrieve_tool_per_hop_not_multi_retrieve(self):
+        retriever = ScriptedRetriever({}, default=_records(2))
+        gen = SequentialGenerator(
+            plan_subqueries=["Where is Springfield?", "Which county is it in?"],
+        )
+        _, trace = self._module(retriever, gen).answer("q", return_trace=True)
+        tool_names = [s["tool_name"] for s in trace["steps"] if s["tool_name"]]
+        self.assertIn("RetrieveTool", tool_names)
+        self.assertNotIn("MultiQueryRetrieveTool", tool_names)
+
+    def test_single_subquery_plan_falls_through_to_parallel(self):
+        # With only one subquery there is no chain to thread, so the sequential path
+        # is skipped and the standard loop runs (no hop_answers recorded).
+        retriever = ScriptedRetriever({}, default=_records(2))
+        gen = SequentialGenerator(plan_subqueries=[])  # planner adds only the original
+        _, trace = self._module(retriever, gen).answer("simple question", return_trace=True)
+        self.assertEqual(trace["hop_answers"], [])
+
+    def test_disabled_by_default_no_hop_answers(self):
+        # Without the flag, even a multi-hop plan uses the parallel path.
+        retriever = ScriptedRetriever({}, default=_records(2))
+        gen = SequentialGenerator(
+            plan_subqueries=["Where is Springfield?", "Which county is it in?"],
+        )
+        module = AgenticRAGModule(
+            retriever,
+            gen,
+            config={"min_evidence_count": 1, "use_llm_planner": True},  # iterative off
+        )
+        _, trace = module.answer("q", return_trace=True)
+        self.assertEqual(trace["hop_answers"], [])
 
 
 if __name__ == "__main__":

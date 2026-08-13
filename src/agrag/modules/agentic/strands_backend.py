@@ -3,7 +3,7 @@
 This module provides an *optional* third backend for the ``QueryPlanner`` and
 ``DecisionPolicy``, alongside the existing rule-based and (raw-Bedrock)
 LLM-backed modes. It uses the `Strands Agents <https://github.com/strands-agents>`_
-SDK driving **Bedrock Claude Haiku 4.5** to emit *only* the plan or the action,
+SDK driving **Bedrock Claude Sonnet 4.6** to emit *only* the plan or the action,
 while Python keeps deriving every tool/action argument deterministically.
 
 Design contract (why this is safe to bolt on):
@@ -53,7 +53,7 @@ class StrandsReasoner:
     """Bedrock/Strands reasoning helper shared by the planner and policy.
 
     A single instance holds one Strands ``Agent`` bound to a ``BedrockModel``
-    (Claude Haiku 4.5 by default) and exposes two narrow methods:
+    (Claude Sonnet 4.6 by default) and exposes two narrow methods:
 
     * :meth:`plan_subqueries` — returns a list of subquery strings (or ``None``).
     * :meth:`choose_action` — returns one action value from a supplied legal set
@@ -68,7 +68,7 @@ class StrandsReasoner:
     ----------
     model_id : str
         Bedrock model id / inference-profile id (e.g.
-        ``us.anthropic.claude-haiku-4-5-20251001-v1:0``).
+        ``us.anthropic.claude-sonnet-4-6``).
     region_name : Optional[str]
         AWS region for the Bedrock runtime client. When ``None`` the SDK/boto3
         default resolution applies.

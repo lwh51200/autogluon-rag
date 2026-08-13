@@ -52,6 +52,85 @@ def preprocess_text(
     return text.strip()
 
 
+# --- Semantic answer equivalence (granularity-tolerant matching) ----------------
+#
+# MuSiQue answers are graded by string containment, which marks semantically
+# correct answers wrong on *granularity*: a prediction of ``1973`` against a gold
+# ``1970s``, or ``Early 1980s`` against ``1981``, are the same fact expressed at a
+# different resolution. These helpers add a narrow, defensible equivalence check
+# layered on top of the existing string match -- it only ever turns a non-match
+# into a match, never the reverse, so it cannot lower a previously-correct score.
+
+_YEAR_RE = re.compile(r"\b(1\d{3}|20\d{2})\b")
+# Decade forms: "1970s", "1980's", "2000s". Captures the base year.
+_DECADE_RE = re.compile(r"\b(1\d{3}|20\d{2})['’]?s\b")
+
+# Small, explicitly-curated bidirectional alias groups for region/containment
+# equivalence (e.g. a river-and-country answer vs. its continent). This is a
+# deliberately conservative, hand-maintained list -- NOT a gazetteer -- so it
+# never introduces surprising matches. Extend as benchmark aliases are confirmed.
+_ALIAS_GROUPS: List[set] = [
+    {"united states", "usa", "u.s.", "u.s.a.", "us", "america", "united states of america"},
+    {"united kingdom", "uk", "u.k.", "britain", "great britain"},
+]
+
+
+def _years_and_decades(text: str):
+    """Extract explicit years and decade-buckets mentioned in ``text``.
+
+    Returns ``(years, decades)`` where ``years`` is the set of 4-digit years and
+    ``decades`` is the set of decade keys (``year // 10``) implied by any decade
+    form (``1970s`` -> ``197``). Years are also added to ``decades`` at their own
+    bucket so a bare year can match a decade on the other side.
+    """
+    decades = {int(m) // 10 for m in _DECADE_RE.findall(text)}
+    years = set()
+    for m in _YEAR_RE.findall(text):
+        # A year already consumed as "1970s" still appears here; that's fine --
+        # its own decade bucket is the same one, so it is idempotent.
+        year = int(m)
+        years.add(year)
+        decades.add(year // 10)
+    return years, decades
+
+
+def _dates_equivalent(gen: str, ref: str) -> bool:
+    """True if the two strings refer to the same date at differing granularity.
+
+    A specific year matches a decade that contains it (``1973`` <-> ``1970s``,
+    ``1981`` <-> ``Early 1980s``). Requires both sides to carry date information;
+    returns False otherwise so non-date answers are untouched.
+    """
+    gen_years, gen_decades = _years_and_decades(gen)
+    ref_years, ref_decades = _years_and_decades(ref)
+    if not (gen_years or gen_decades) or not (ref_years or ref_decades):
+        return False
+    if gen_years & ref_years:
+        return True
+    # A concrete year on either side falling into the other side's decade bucket.
+    if any(y // 10 in ref_decades for y in gen_years):
+        return True
+    if any(y // 10 in gen_decades for y in ref_years):
+        return True
+    return False
+
+
+def _alias_equivalent(gen: str, ref: str) -> bool:
+    """True if ``gen`` and ``ref`` fall in the same curated alias group."""
+    g, r = gen.strip(), ref.strip()
+    return any(g in group and r in group for group in _ALIAS_GROUPS)
+
+
+def answers_equivalent(gen_resp: str, exp_resp: str) -> bool:
+    """Granularity-tolerant equivalence beyond plain string containment.
+
+    Applied only after the exact/substring test fails; returns True when the
+    prediction and reference denote the same fact via date-granularity or a
+    curated region alias. Both inputs should already be ``preprocess_text``-ed.
+    """
+    return _dates_equivalent(gen_resp, exp_resp) or _alias_equivalent(gen_resp, exp_resp)
+
+
 def inclusive_exact_match_metric(
     predictions: List[str],
     references: List[List[str]],
@@ -96,7 +175,7 @@ def inclusive_exact_match_metric(
         for exp_resp in exp_resps:
             exp_resp = preprocess_text(exp_resp, regexes_to_ignore, ignore_case, ignore_punctuation, ignore_numbers)
 
-            if gen_resp == exp_resp or exp_resp in gen_resp:
+            if gen_resp == exp_resp or exp_resp in gen_resp or answers_equivalent(gen_resp, exp_resp):
                 match_found = True
                 break
         exact_matches.append(match_found)

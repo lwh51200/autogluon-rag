@@ -43,9 +43,10 @@ class AgenticRAGModule:
         Agent configuration (see configs/agent/default.yaml). Recognized keys:
         max_iterations, max_subqueries, retrieve_top_k_per_query,
         use_query_rewrite, use_context_compression, use_verification,
-        min_evidence_count, max_context_tokens, min_subgoal_coverage,
-        min_relevance, query_prefix, use_llm_planner, use_llm_policy,
-        use_strands_planner, use_strands_policy.
+        allow_abstention, max_rewrites, min_evidence_count, max_context_tokens,
+        min_subgoal_coverage, min_relevance, query_prefix, use_llm_planner,
+        use_llm_policy, use_strands_planner, use_strands_policy,
+        use_iterative_planner.
     """
 
     def __init__(self, retriever_module, generator_module, config: Optional[Dict[str, Any]] = None):
@@ -59,6 +60,17 @@ class AgenticRAGModule:
         self.use_query_rewrite = cfg.get("use_query_rewrite", True)
         self.use_context_compression = cfg.get("use_context_compression", False)
         self.use_verification = cfg.get("use_verification", True)
+        # Never-refuse is the default: the agent iterates (rewrite + retrieve more)
+        # on weak/failed verification and, when iteration is exhausted, returns a
+        # best-effort evidence-grounded answer instead of the canned abstention.
+        # Verification still runs and steers those rewrites. Set allow_abstention
+        # True to restore the ability to refuse (abstain) when a question is
+        # unanswerable from the corpus.
+        self.allow_abstention = cfg.get("allow_abstention", False)
+        # How many query rewrites a single run may issue. This is the main lever on
+        # how hard the agent iterates for new evidence (re-retrieving the same query
+        # adds nothing), so the never-refuse default benefits from more than one.
+        self.max_rewrites = cfg.get("max_rewrites", 2)
         self.min_evidence_count = cfg.get("min_evidence_count", 2)
         self.max_context_tokens = cfg.get("max_context_tokens", 6000)
         self.min_subgoal_coverage = cfg.get("min_subgoal_coverage", 0.5)
@@ -70,6 +82,10 @@ class AgenticRAGModule:
         self.use_llm_policy = cfg.get("use_llm_policy", False)
         self.use_strands_planner = cfg.get("use_strands_planner", False)
         self.use_strands_policy = cfg.get("use_strands_policy", False)
+        # Sequential-hop execution: resolve subqueries in order, threading each
+        # hop's answer into the next hop's retrieval query. Default off -> the
+        # existing single up-front parallel MULTI_RETRIEVE behavior is unchanged.
+        self.use_iterative_planner = cfg.get("use_iterative_planner", False)
 
         self._build_components()
 
@@ -153,10 +169,12 @@ class AgenticRAGModule:
             max_context_tokens=self.max_context_tokens,
             min_subgoal_coverage=self.min_subgoal_coverage,
             min_relevance=self.min_relevance,
+            max_rewrites=self.max_rewrites,
             max_iterations=self.max_iterations,
             generator_module=self.generator_module,
             use_llm=self.use_llm_policy,
             strands_backend=strands_backend if self.use_strands_policy else None,
+            allow_abstention=self.allow_abstention,
         )
         self.executor = AgentExecutor(
             tool_registry=self.tool_registry,
@@ -165,6 +183,8 @@ class AgenticRAGModule:
             synthesizer=self.synthesizer,
             verifier=self.verifier,
             max_iterations=self.max_iterations,
+            allow_abstention=self.allow_abstention,
+            use_iterative_planner=self.use_iterative_planner,
         )
 
     def answer(self, query: str, return_trace: bool = False) -> Union[str, Tuple[str, Dict[str, Any]]]:

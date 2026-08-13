@@ -24,6 +24,12 @@ local_example/**/corpus/
 benchmark_results.json
 local_example/**/benchmark_results.json
 
+# Runtime artifacts written to the repo root by ad-hoc runs / tests (vector
+# index + metadata paths, local vector db). Sources are never placed here.
+/test_index_path/
+/test_metadata_path/
+/vectordb/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

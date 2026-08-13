@@ -13,14 +13,18 @@ data:
   children_per_parent: 4
 
 embedding:
-  # Small HuggingFace embedding model that runs on CPU
-  embedding_model: sentence-transformers/all-MiniLM-L6-v2
-  embedding_model_platform: huggingface
+  # AWS Bedrock Cohere Embed English v3 embedding model.
+  embedding_model: cohere.embed-english-v3
+  embedding_model_platform: bedrock
   embedding_model_platform_args:
+    bedrock_aws_region: us-west-2
     hf_tokenizer_params:
       truncation: true
       padding: true
-  pooling_strategy: mean
+  # Bedrock Cohere returns already-pooled sentence embeddings (a plain list), so
+  # token-level pooling must NOT run -- pool(list, "mean") would do list.mean() and
+  # raise "'list' object has no attribute 'mean'". null = return embeddings as-is.
+  pooling_strategy: null
   normalize_embeddings: false   # upstream normalize_embedding() has a kwargs bug; skip it
   normalization_params: {'p': 2, 'dim': 1, 'eps': 1e-12}
   embedding_batch_size: 32
@@ -40,14 +44,18 @@ vector_db:
   metadata_index_load_path: local_example/vector_db_metadata/metadata.json
 
 retriever:
-  retriever_top_k: 5
-  # Cross-encoder reranker ON. The rerank stage of both hybrid retrieve() and the
-  # agentic retrieve_fused() is gated on a live reranker; without it that stage
-  # silently no-ops. bge-reranker-base is a real cross-encoder (relevance head)
-  # and lighter than -large for CPU. NOTE: bge-large-en is an EMBEDDING model with
-  # no reranker head and must not be used here.
-  use_reranker: true
-  reranker_top_k: 5
+  # Maximize chunks reaching the generator. With the reranker OFF, the standard
+  # hybrid path (_retrieve_advanced) has no final top-k truncation, so every fused
+  # dense+sparse candidate is passed to the generator; the agentic path
+  # (retrieve_fused) still caps at retriever_top_k. Raising retriever_top_k widens
+  # both. 20 pulls up to 20 dense + 20 sparse candidates per query (deduped/fused).
+  retriever_top_k: 20
+  # Cross-encoder reranker DISABLED. With use_reranker: false the rerank stage of
+  # both hybrid retrieve() and agentic retrieve_fused() no-ops, and the standard
+  # path's truncate-to-reranker_top_k step disappears -- so more chunks reach the
+  # generator. reranker_top_k is now unused (kept for reference).
+  use_reranker: false
+  reranker_top_k: 20
   reranker_model_name: BAAI/bge-reranker-base
   reranker_model_platform: huggingface
   reranker_batch_size: 8
@@ -78,13 +86,20 @@ agent:
   # retrievable over-refusal capped at iters=5). Give the loop more room to
   # decompose/retrieve/draft before falling back to abstain.
   max_iterations: 8
+  # Never-refuse is the default now (allow_abstention defaults to false), so no
+  # flag is needed to always return an answer. On weak/failed verification the
+  # agent rewrites and retrieves more; when that iteration is exhausted it returns
+  # a best-effort, evidence-grounded answer instead of the canned abstention.
+  # Raise the rewrite budget so "iterate more" is meaningful: only a rewrite (a new
+  # query) surfaces new evidence -- re-retrieving the same query is deduped away.
+  max_rewrites: 2
 
 generator:
-  # Generator via AWS Bedrock (Claude Haiku 4.5) for meaningful answers.
+  # Generator via AWS Bedrock (Claude Sonnet 4.6) for meaningful answers.
   # Active Bedrock Claude models require the "us." inference-profile prefix.
   # For a no-credentials run, swap this block for a local HuggingFace generator
   # (e.g. sshleifer/tiny-gpt2 with platform huggingface).
-  generator_model_name: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  generator_model_name: us.anthropic.claude-sonnet-4-6
   generator_model_platform: bedrock
   num_gpus: 0
   generator_model_platform_args:

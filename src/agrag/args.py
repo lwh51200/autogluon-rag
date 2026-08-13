@@ -808,6 +808,24 @@ class Arguments:
         self.config.setdefault("agent", {})["min_relevance"] = value
 
     @property
+    def agent_allow_abstention(self):
+        return self.config.get("agent", {}).get(
+            "allow_abstention", self.agent_defaults.get("AGENT_ALLOW_ABSTENTION")
+        )
+
+    @agent_allow_abstention.setter
+    def agent_allow_abstention(self, value):
+        self.config.setdefault("agent", {})["allow_abstention"] = value
+
+    @property
+    def agent_max_rewrites(self):
+        return self.config.get("agent", {}).get("max_rewrites", self.agent_defaults.get("AGENT_MAX_REWRITES"))
+
+    @agent_max_rewrites.setter
+    def agent_max_rewrites(self, value):
+        self.config.setdefault("agent", {})["max_rewrites"] = value
+
+    @property
     def agent_return_trace(self):
         return self.config.get("agent", {}).get("return_trace", self.agent_defaults.get("AGENT_RETURN_TRACE"))
 
@@ -860,3 +878,13 @@ class Arguments:
     @agent_use_strands_policy.setter
     def agent_use_strands_policy(self, value):
         self.config.setdefault("agent", {})["use_strands_policy"] = value
+
+    @property
+    def agent_use_iterative_planner(self):
+        return self.config.get("agent", {}).get(
+            "use_iterative_planner", self.agent_defaults.get("AGENT_USE_ITERATIVE_PLANNER")
+        )
+
+    @agent_use_iterative_planner.setter
+    def agent_use_iterative_planner(self, value):
+        self.config.setdefault("agent", {})["use_iterative_planner"] = value

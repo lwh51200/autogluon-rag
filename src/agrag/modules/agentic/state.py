@@ -97,6 +97,11 @@ class AgentState:
         a rewrite (via ``set_current_query``); compression is chosen just before
         drafting for the current query, so it is regenerated per query rather than
         per retrieval.
+    hop_answers : List[Dict[str, str]]
+        Ordered chain of resolved intermediate answers, one per hop, populated only
+        by the sequential-hop executor (``use_iterative_planner``). Each entry is
+        ``{"subquery", "hop_query", "answer"}`` where ``hop_query`` is the subquery
+        after prior hops' answers were substituted in. Empty on the parallel path.
     iteration : int
         Current loop iteration (0-based).
     status : AgentStatus
@@ -113,6 +118,7 @@ class AgentState:
     verification: Optional[Dict[str, Any]] = None
     last_verification: Optional[Dict[str, Any]] = None
     compressed_context: Optional[str] = None
+    hop_answers: List[Dict[str, str]] = field(default_factory=list)
     iteration: int = 0
     status: AgentStatus = AgentStatus.IN_PROGRESS
 
@@ -218,6 +224,7 @@ class AgentState:
             "verification": self.verification,
             "last_verification": self.last_verification,
             "compressed_context": self.compressed_context,
+            "hop_answers": [dict(h) for h in self.hop_answers],
             "iteration": self.iteration,
             "status": self.status.value,
         }

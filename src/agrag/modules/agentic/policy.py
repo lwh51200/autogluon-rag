@@ -18,7 +18,7 @@ Three modes are supported, in precedence order Strands > LLM > rule-based:
   assembled deterministically here, so the model can never emit a query string
   or tool argument that breaks the executor.
 * **Strands-backed** (opt-in via a ``strands_backend``): a Strands agent driving
-  Bedrock Haiku 4.5 chooses among the legal actions, constrained to that exact
+  Bedrock Sonnet 4.6 chooses among the legal actions, constrained to that exact
   set by a JSON-schema enum (Pydantic structured output). It too returns only an
   action value; ``_build_args`` still assembles arguments deterministically.
 
@@ -118,7 +118,18 @@ class DecisionPolicy:
         gate. Scores are compared only when evidence actually carries them, so a
         score-less retriever never blocks drafting.
     max_rewrites : int
-        Upper bound on query rewrites within a single run.
+        Upper bound on query rewrites within a single run. This is the primary
+        knob for how much the agent may *iterate* to surface new evidence: because
+        re-retrieving the same query is deduplicated to nothing, only a rewrite (a
+        new query) can add evidence. Defaults to 2.
+    allow_abstention : bool
+        Opt-in switch for refusing to answer. When False (the default) ABSTAIN is
+        never offered as one of several fork options — so the LLM/Strands policy
+        can never *choose* to give up over iterating — and survives only as a
+        forced sole terminal (no rewrite budget and no new evidence), which the
+        executor converts into a best-effort answer. When True the original
+        behavior is restored: ABSTAIN is offered as a fallback alongside
+        rewrite/draft and as a terminal that leads to the canned abstention.
     max_iterations : Optional[int]
         The executor's loop budget. When set, the policy will not choose to
         rewrite the query on the final iteration: a rewrite is only useful if
@@ -153,11 +164,12 @@ class DecisionPolicy:
         max_context_tokens: int = 6000,
         min_subgoal_coverage: float = 0.5,
         min_relevance: Optional[float] = None,
-        max_rewrites: int = 1,
+        max_rewrites: int = 2,
         max_iterations: int = None,
         generator_module=None,
         use_llm: bool = False,
         strands_backend=None,
+        allow_abstention: bool = False,
     ):
         self.min_evidence_count = min_evidence_count
         self.use_query_rewrite = use_query_rewrite
@@ -170,6 +182,7 @@ class DecisionPolicy:
         self.generator_module = generator_module
         self.use_llm = use_llm
         self.strands_backend = strands_backend
+        self.allow_abstention = allow_abstention
 
     @property
     def _llm_enabled(self) -> bool:
@@ -217,6 +230,26 @@ class DecisionPolicy:
         if state.draft_answer is None or state.verification is None:
             return False
         return not self.accept_verification(state.verification)
+
+    def _new_evidence_since_last_draft(self, state: AgentState) -> bool:
+        """Whether any retrieval added evidence after the most recent draft.
+
+        A failed draft only justifies re-drafting if the evidence has actually
+        changed since — otherwise re-drafting would reproduce the same rejected
+        answer. Scans history back to the last ``draft_answer`` step and reports
+        whether a retrieval recorded ``evidence_added > 0`` after it. Returns False
+        when no draft has been recorded yet.
+        """
+        retrieve_actions = (ActionType.RETRIEVE.value, ActionType.MULTI_RETRIEVE.value)
+        added_after_draft = 0
+        seen_draft = False
+        for record in state.history:
+            if record.action_type == ActionType.DRAFT_ANSWER.value:
+                seen_draft = True
+                added_after_draft = 0  # reset: only count evidence after the latest draft
+            elif seen_draft and record.action_type in retrieve_actions:
+                added_after_draft += record.evidence_added
+        return seen_draft and added_after_draft > 0
 
     def _compression_attempted(self, state: AgentState) -> bool:
         """Whether compression has already been tried for the current query.
@@ -299,12 +332,18 @@ class DecisionPolicy:
            single). No fork: drafting before any evidence is never allowed, and
            choosing single over multi at the start has little upside for a
            guaranteed extra LLM call.
-        2. If evidence is below the minimum: rewrite (to gather better evidence)
-           OR abstain (give up as unanswerable), when a rewrite is allowed and in
-           budget; otherwise abstain. Drafting below the evidence floor is never
-           legal (the verifier would short-circuit to insufficient_evidence).
-        3. If the latest draft failed verification: rewrite OR abstain (same fork),
-           when a rewrite is allowed; otherwise abstain.
+        2. If evidence is below the minimum: rewrite to gather better evidence when
+           a rewrite is allowed and in budget; otherwise abstain (give up as
+           unanswerable). When ``allow_abstention`` is set, abstain is additionally
+           offered as a discretionary fallback alongside the rewrite. Drafting
+           below the evidence floor is never legal (the verifier would
+           short-circuit to insufficient_evidence).
+        3. If the latest draft failed verification: when new evidence has arrived
+           since that draft, re-drafting can now succeed, so draft OR rewrite
+           (draft first, the default). When no new evidence has arrived, re-drafting
+           would only reproduce the rejected answer, so rewrite (when allowed);
+           otherwise abstain. When ``allow_abstention`` is set, abstain is also
+           offered as a discretionary fallback in each of these forks (as before).
         4. If context compression is enabled and the evidence exceeds the token
            budget: compress oversized context first OR draft now.
         5. Otherwise (enough evidence, nothing failing): draft the answer OR, when
@@ -322,13 +361,38 @@ class DecisionPolicy:
             return [ActionType.RETRIEVE]
 
         if len(evidence_store) < self.min_evidence_count:
+            # Below the evidence floor. Rewrite to gather more; abstain only when a
+            # rewrite is no longer possible. In never-refuse mode ABSTAIN is not
+            # offered as a discretionary alternative to the rewrite — it appears
+            # only as the forced sole terminal the executor turns into a best
+            # effort. In refuse mode it is offered as the fallback, as before.
             if self._can_rewrite(state):
-                return [ActionType.REWRITE_QUERY, ActionType.ABSTAIN]
+                if self.allow_abstention:
+                    return [ActionType.REWRITE_QUERY, ActionType.ABSTAIN]
+                return [ActionType.REWRITE_QUERY]
             return [ActionType.ABSTAIN]
 
         if self._last_draft_failed(state):
+            # A single failed verification is not terminal: if new evidence has
+            # arrived since that draft, re-drafting can now succeed, so offer it
+            # again (first, so it is the default). Without new evidence, re-drafting
+            # would only reproduce the rejected answer, so fall back to a rewrite to
+            # gather better evidence. ABSTAIN keeps the loop terminating: in
+            # never-refuse mode it is only the forced sole terminal (no new evidence
+            # AND no rewrite budget), never a discretionary option; in refuse mode
+            # it is offered as the fallback alongside draft/rewrite, as before.
+            if self._new_evidence_since_last_draft(state):
+                if self._can_rewrite(state):
+                    if self.allow_abstention:
+                        return [ActionType.DRAFT_ANSWER, ActionType.REWRITE_QUERY, ActionType.ABSTAIN]
+                    return [ActionType.DRAFT_ANSWER, ActionType.REWRITE_QUERY]
+                if self.allow_abstention:
+                    return [ActionType.DRAFT_ANSWER, ActionType.ABSTAIN]
+                return [ActionType.DRAFT_ANSWER]
             if self._can_rewrite(state):
-                return [ActionType.REWRITE_QUERY, ActionType.ABSTAIN]
+                if self.allow_abstention:
+                    return [ActionType.REWRITE_QUERY, ActionType.ABSTAIN]
+                return [ActionType.REWRITE_QUERY]
             return [ActionType.ABSTAIN]
 
         if (

@@ -18,8 +18,9 @@ static-vs-agentic gap concentrates in ``comparison_query`` and ``null_query``
 
 Environment note
 ----------------
-Reuses ``local_example/local_config.yaml`` (MiniLM embeddings + Bedrock Claude
-Haiku generator). For a no-credentials run, swap the generator in that config
+Reuses ``local_example/local_config.yaml`` (Bedrock Cohere Embed English v3
+embeddings + Bedrock Claude Sonnet 4.6 generator). For a no-credentials run,
+swap the generator in that config
 back to a local HuggingFace model; absolute quality numbers only matter with a
 real generator, but the pipeline wiring and per-type deltas are what this shows.
 """
