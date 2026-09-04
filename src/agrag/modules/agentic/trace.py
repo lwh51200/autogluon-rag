@@ -2,8 +2,8 @@
 
 When ``generate_response(..., return_trace=True)`` is used, the agent returns a
 structured trace alongside the answer. The trace is a serializable snapshot that
-supports debugging, citation inspection, and the performance metrics described in
-the design (latency, retrieval-call count, tool-call count, evidence count). It
+supports debugging, citation inspection, and the performance metrics (latency,
+retrieval-call count, tool-call count, evidence count). It
 assembles data already held by ``AgentState`` and ``EvidenceStore`` — it does not
 own any new state.
 """
@@ -50,6 +50,11 @@ class AgentTrace:
     original_query: str
     final_answer: Optional[str] = None
     status: str = ""
+    # When ``status`` is ``answered_unverified`` (or a never-refuse MAX_ITERATIONS
+    # best effort), the machine-readable reason it could not be verified (see
+    # ``state.Reason``): ``unsupported``, ``no_evidence``, ``dependency_unresolved``,
+    # ``ambiguous``, or ``budget_exhausted``. ``None`` for a verified answer.
+    unverified_reason: Optional[str] = None
     verification: Optional[Dict[str, Any]] = None
     plan: List[str] = field(default_factory=list)
     subqueries: List[str] = field(default_factory=list)
@@ -92,8 +97,29 @@ class AgentTrace:
 
         metrics: Dict[str, Any] = {
             "iterations": state.iteration,
+            # Whole-plan re-decomposition passes taken by the sequential-hop
+            # recovery loop (0 on every other path). Surfaced here so per-row
+            # recovery activity is analyzable from the trace instead of only the
+            # logs; the per-hop candidate re-retrieval is visible via each
+            # ``hop_answers`` entry's ``recovered`` flag.
+            "recovery_attempts": state.recovery_attempts,
+            # Local (in-plan) hop-recovery passes -- the extra hypothesized-seed
+            # retrieval issued when a hop grounds to UNKNOWN (0 on every other path).
+            # Surfaced alongside ``recovery_attempts`` so both recovery modes are
+            # analyzable per row; they draw on separate budgets and diagnose
+            # different failure modes.
+            "hop_recovery_attempts": state.hop_recovery_attempts,
+            # Retrieval-tool exceptions swallowed this run (>0 signals a systematic
+            # retriever/backend error rather than "found nothing"; the first is also
+            # logged at WARNING).
+            "retrieval_failures": state.retrieval_failures,
             "tool_calls": state.tool_call_count,
             "retrieval_calls": retrieval_calls,
+            # Budget-accounted counters (drive the wall-clock/call caps). Kept
+            # separate from the history-derived ``retrieval_calls`` above, which only
+            # counts recorded steps; these also include swallowed retrieval failures.
+            "llm_calls": state.llm_calls,
+            "retrieval_calls_budgeted": state.retrieval_calls,
             "evidence_count": len(evidence_store),
             "cited_evidence_count": cited,
         }
@@ -104,6 +130,7 @@ class AgentTrace:
             original_query=state.original_query,
             final_answer=final_answer,
             status=state.status.value,
+            unverified_reason=state.unverified_reason,
             # Prefer the run-level verification (survives a rewrite) so the trace
             # reflects the last draft's verdict even after a final-iteration
             # rewrite cleared the per-query verification.

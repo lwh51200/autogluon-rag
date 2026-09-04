@@ -18,10 +18,13 @@ from agrag.modules.retriever.rerankers.reranker import Reranker
 from agrag.modules.retriever.retrievers.retriever_base import RetrieverModule
 from agrag.modules.retriever.retrievers.sparse_retriever import BM25Retriever
 from agrag.modules.vector_db.utils import (
+    compare_index_fingerprint,
     load_index,
+    load_index_fingerprint,
     load_metadata,
     load_parent_store,
     save_index,
+    save_index_fingerprint,
     save_metadata,
     save_parent_store,
 )
@@ -154,6 +157,9 @@ class AutoGluonRAG:
         self.reranker_module = None
         self.retriever_module = None
         self.generator_module = None
+        # Optional independent verifier generator (agentic path only); populated by
+        # initialize_verifier_generator_module() when agent_verifier_model is set.
+        self.verifier_generator_module = None
         self.agentic_module = None
         # Parent-chunk store for parent-child (hierarchical) chunking; populated
         # during data processing or when loading an existing index. None with
@@ -179,6 +185,11 @@ class AutoGluonRAG:
     def _load_preset(self):
         """Loads a preset configuration based on the preset quality setting."""
         presets = {"medium_quality": os.path.join(PRESETS_CONFIG_DIRECTORY, "medium_quality_config.yaml")}
+        if self.preset_quality not in presets:
+            raise ValueError(
+                f"Unsupported preset_quality '{self.preset_quality}'. "
+                f"Supported presets: {sorted(presets)}. Pass a config_file for other settings."
+            )
         logger.info(f"Loading Preset '{self.preset_quality}' configuration")
         return presets[self.preset_quality]
 
@@ -274,6 +285,30 @@ class AutoGluonRAG:
             num_gpus=num_gpus,
         )
         logger.info("Generator module initialized")
+
+    def initialize_verifier_generator_module(self):
+        """Build a SEPARATE generator for the agentic answer verifier, if configured.
+
+        When ``agent_verifier_model`` is set, the verifier judges with a different
+        (ideally stronger) model than the one that drafts the answer -- breaking the
+        correlated-error failure mode where the same model both writes and rubber-stamps
+        a plausible-but-wrong answer. It reuses the generator platform/args (region,
+        bedrock params) so only the model id changes. When unset, returns ``None`` and
+        the agentic module falls back to sharing ``self.generator_module`` (prior
+        behavior). Kept off the standard RAG path entirely.
+        """
+        verifier_model = self.args.agent_verifier_model
+        if not verifier_model or verifier_model == self.args.generator_model_name:
+            self.verifier_generator_module = None
+            return
+        num_gpus = get_num_gpus(self.args.generator_num_gpus)
+        self.verifier_generator_module = GeneratorModule(
+            model_name=verifier_model,
+            model_platform=self.args.generator_model_platform,
+            platform_args=self.args.generator_model_platform_args,
+            num_gpus=num_gpus,
+        )
+        logger.info("Verifier generator module initialized with model %s", verifier_model)
 
     def initialize_reranker_module(self):
         """Initializes the Reranker module."""
@@ -405,6 +440,26 @@ class AutoGluonRAG:
         logger.info(f"Loading existing metadata from {metadata_path}")
         self.vector_db_module.metadata = load_metadata(metadata_path)
 
+        # Refuse to reuse an index built under a different embedding/metric config:
+        # e.g. an IndexFlatIP index built from normalized vectors, loaded under an
+        # L2/unnormalized config, ranks results backwards and silently degrades
+        # retrieval. A legacy index with no fingerprint sidecar loads with a warning
+        # (backward compatible), but any concrete field mismatch is a hard error.
+        stored_fingerprint = load_index_fingerprint(metadata_path)
+        mismatches = compare_index_fingerprint(stored_fingerprint, self._index_fingerprint())
+        if mismatches:
+            if stored_fingerprint is None:
+                logger.warning(
+                    "Loaded index has no fingerprint; cannot verify it matches the current "
+                    "embedding/metric config. Proceeding, but rebuild the index if retrieval looks wrong."
+                )
+            else:
+                raise ValueError(
+                    "Refusing to load a vector DB index that does not match the current config:\n  - "
+                    + "\n  - ".join(mismatches)
+                    + "\nRebuild the index (set use_existing_vector_db false) or restore the matching config."
+                )
+
         # Load the optional parent store (None for indexes built with flat
         # chunking or before parent-child chunking existed).
         self.parent_store = load_parent_store(metadata_path)
@@ -444,6 +499,29 @@ class AutoGluonRAG:
         # produced one (no-op otherwise).
         if getattr(self, "parent_store", None) is not None:
             save_parent_store(self.parent_store, metadata_path)
+        # Persist a fingerprint of the embedding/metric config the index was built
+        # under, so a later load can refuse a mismatched/stale index rather than
+        # silently reusing vectors built under different assumptions.
+        save_index_fingerprint(self._index_fingerprint(), metadata_path)
+
+    def _index_fingerprint(self) -> Dict[str, Any]:
+        """Describe the embedding/metric config that defines index compatibility.
+
+        Fields mirror ``vector_db.utils.INDEX_FINGERPRINT_FIELDS``. ``embedding_dim``
+        is read from the built FAISS index (``.d``) when available so it reflects the
+        actual stored vectors, not just config; the rest come from ``self.args``.
+        """
+        embedding_dim = None
+        index = getattr(self.vector_db_module, "index", None)
+        if index is not None:
+            embedding_dim = getattr(index, "d", None)
+        return {
+            "embedding_model": self.args.embedding_model,
+            "embedding_dim": embedding_dim,
+            "normalize_embeddings": self.args.normalize_embeddings,
+            "similarity_fn": self.args.vector_db_sim_fn,
+            "faiss_index_type": self.args.faiss_index_type,
+        }
 
     def retrieve_context_for_query(self, query: str) -> List[Dict[str, Any]]:
         """
@@ -490,18 +568,43 @@ class AutoGluonRAG:
             "use_strands_planner": self.args.agent_use_strands_planner,
             "use_strands_policy": self.args.agent_use_strands_policy,
             "use_iterative_planner": self.args.agent_use_iterative_planner,
+            "use_hop_recovery": self.args.agent_use_hop_recovery,
+            "use_replan_recovery": self.args.agent_use_replan_recovery,
+            "max_recovery_attempts": self.args.agent_max_recovery_attempts,
+            "max_total_hops": self.args.agent_max_total_hops,
+            "deep_hop_top_k": self.args.agent_deep_hop_top_k,
+            "deep_hop_threshold": self.args.agent_deep_hop_threshold,
+            "use_entity_grounding": self.args.agent_use_entity_grounding,
+            "final_answer_drop_prefix": self.args.agent_final_answer_drop_prefix,
+            "use_direct_answer_fallback": self.args.agent_use_direct_answer_fallback,
+            # Real cost budgets (wall-clock seconds, generator-call count,
+            # retrieval-call count). Each None -> unbounded; on breach the run
+            # returns its best-effort answer tagged ANSWERED_UNVERIFIED with
+            # reason ``budget_exhausted``.
+            "max_wall_clock_s": self.args.agent_max_wall_clock_s,
+            "max_llm_calls": self.args.agent_max_llm_calls,
+            "max_retrieval_calls": self.args.agent_max_retrieval_calls,
             # Share the standard-path query prefix so answer formatting is
             # consistent across standard and agentic modes.
             "query_prefix": self.args.generator_query_prefix,
+            "extract_answer": self.args.agent_extract_answer,
+            "verify_retry": self.args.agent_verify_retry,
+            # Dual-candidate synthesis + arbitration and self-consistency on the
+            # final draft (both default off/1 -> unchanged behavior).
+            "dual_synthesis": self.args.agent_dual_synthesis,
+            "self_consistency": self.args.agent_self_consistency,
         }
 
     def initialize_agentic_module(self):
         """Initializes the Agentic RAG module, reusing the retriever and generator."""
         from agrag.modules.agentic.agentic_module import AgenticRAGModule
 
+        # Build the (optional) independent verifier generator before wiring the module.
+        self.initialize_verifier_generator_module()
         self.agentic_module = AgenticRAGModule(
             retriever_module=self.retriever_module,
             generator_module=self.generator_module,
+            verifier_generator_module=self.verifier_generator_module,
             config=self._agent_config(),
         )
         logger.info("Agentic RAG module initialized")

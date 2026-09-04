@@ -14,6 +14,7 @@ def preprocess_text(
     ignore_case: bool = False,
     ignore_punctuation: bool = False,
     ignore_numbers: bool = False,
+    ignore_articles: bool = False,
 ) -> str:
     """
     Preprocesses text by applying specified transformations.
@@ -30,6 +31,12 @@ def preprocess_text(
         If True, removes punctuation.
     ignore_numbers : bool
         If True, removes all digits.
+    ignore_articles : bool
+        If True, drops the standalone articles ``a``/``an``/``the`` (matched
+        case-insensitively as whole words) and collapses the resulting whitespace.
+        This is the standard SQuAD/MuSiQue normalization: it lets ``the Beatles``
+        match ``Beatles`` without ever changing a content token, so it can only turn
+        a non-match into a match, never the reverse.
 
     Returns:
     -------
@@ -49,13 +56,17 @@ def preprocess_text(
     if ignore_numbers:
         text = re.sub(r"\d+", "", text)
 
+    if ignore_articles:
+        text = re.sub(r"\b(?:a|an|the)\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text)
+
     return text.strip()
 
 
 # --- Semantic answer equivalence (granularity-tolerant matching) ----------------
 #
 # MuSiQue answers are graded by string containment, which marks semantically
-# correct answers wrong on *granularity*: a prediction of ``1973`` against a gold
+# correct answers wrong on granularity: a prediction of ``1973`` against a gold
 # ``1970s``, or ``Early 1980s`` against ``1981``, are the same fact expressed at a
 # different resolution. These helpers add a narrow, defensible equivalence check
 # layered on top of the existing string match -- it only ever turns a non-match
@@ -67,7 +78,7 @@ _DECADE_RE = re.compile(r"\b(1\d{3}|20\d{2})['’]?s\b")
 
 # Small, explicitly-curated bidirectional alias groups for region/containment
 # equivalence (e.g. a river-and-country answer vs. its continent). This is a
-# deliberately conservative, hand-maintained list -- NOT a gazetteer -- so it
+# deliberately conservative, hand-maintained list -- not a gazetteer -- so it
 # never introduces surprising matches. Extend as benchmark aliases are confirmed.
 _ALIAS_GROUPS: List[set] = [
     {"united states", "usa", "u.s.", "u.s.a.", "us", "america", "united states of america"},
@@ -138,6 +149,7 @@ def inclusive_exact_match_metric(
     ignore_case: bool = False,
     ignore_punctuation: bool = False,
     ignore_numbers: bool = False,
+    substring: bool = True,
 ) -> List[bool]:
     """
     Inclusive exact match metric to check if predictions match the references.
@@ -156,6 +168,12 @@ def inclusive_exact_match_metric(
         If True, removes punctuation.
     ignore_numbers : bool
         If True, removes all digits.
+    substring : bool
+        If True (default), a reference counts as a match when it appears as a
+        substring of the prediction (``exp_resp in gen_resp``) -- the "inclusive"
+        behavior. Set False for a strict metric that requires normalized equality
+        (with the ``answers_equivalent`` date/alias fallback) but does not credit a
+        gold answer merely buried inside a longer prediction.
 
     Returns:
     -------
@@ -169,13 +187,17 @@ def inclusive_exact_match_metric(
     exact_matches = []
 
     for gen_resp, exp_resps in zip(predictions, references):
-        gen_resp = preprocess_text(gen_resp, regexes_to_ignore, ignore_case, ignore_punctuation, ignore_numbers)
+        gen_resp = preprocess_text(
+            gen_resp, regexes_to_ignore, ignore_case, ignore_punctuation, ignore_numbers, ignore_articles=True
+        )
         match_found = False
 
         for exp_resp in exp_resps:
-            exp_resp = preprocess_text(exp_resp, regexes_to_ignore, ignore_case, ignore_punctuation, ignore_numbers)
+            exp_resp = preprocess_text(
+                exp_resp, regexes_to_ignore, ignore_case, ignore_punctuation, ignore_numbers, ignore_articles=True
+            )
 
-            if gen_resp == exp_resp or exp_resp in gen_resp or answers_equivalent(gen_resp, exp_resp):
+            if gen_resp == exp_resp or (substring and exp_resp in gen_resp) or answers_equivalent(gen_resp, exp_resp):
                 match_found = True
                 break
         exact_matches.append(match_found)
@@ -223,10 +245,10 @@ def token_f1(prediction: str, references: List[str]) -> float:
     float
         The best token-F1 over ``references`` (0.0 if ``references`` is empty).
     """
-    pred_tokens = preprocess_text(prediction, ignore_case=True, ignore_punctuation=True).split()
+    pred_tokens = preprocess_text(prediction, ignore_case=True, ignore_punctuation=True, ignore_articles=True).split()
     best = 0.0
     for ref in references:
-        ref_tokens = preprocess_text(ref, ignore_case=True, ignore_punctuation=True).split()
+        ref_tokens = preprocess_text(ref, ignore_case=True, ignore_punctuation=True, ignore_articles=True).split()
         # Edge case: if either side is empty, F1 is 1.0 only when both are empty
         # (SQuAD convention), otherwise 0.0.
         if not pred_tokens or not ref_tokens:
@@ -348,7 +370,7 @@ def _rouge_l_f(pred_tokens: List[str], ref_tokens: List[str]) -> float:
 def rouge_scores(prediction: str, references: List[str]) -> dict:
     """Best-over-references ROUGE-1 / ROUGE-2 / ROUGE-L F-measure for one example.
 
-    F-measure, **no stemmer**: tokenization reuses ``preprocess_text`` (lowercase +
+    F-measure, no stemmer: tokenization reuses ``preprocess_text`` (lowercase +
     strip punctuation, whitespace split), identical to ``token_f1`` so ROUGE is
     consistent with the other answer metrics. Each ROUGE type is scored against
     every reference (gold answer + aliases) and the max is kept, mirroring
@@ -391,7 +413,7 @@ def rouge_scores(prediction: str, references: List[str]) -> dict:
 def rouge_geometric_mean(predictions: List[str], references: List[List[str]], ndigits: int = 4) -> dict:
     """Corpus ROUGE geometric mean = ``(ROUGE-1 x ROUGE-2 x ROUGE-L)^(1/3)``.
 
-    Aggregation is **mean-then-GM**: the per-example ROUGE-1/2/L F-measures are each
+    Aggregation is mean-then-GM: the per-example ROUGE-1/2/L F-measures are each
     averaged across the dataset first, and the geometric mean is taken over the three
     means. This is deliberate -- MuSiQue answers are often 1-2 tokens, so per-example
     ROUGE-2 is frequently 0; a per-example geometric mean would collapse those

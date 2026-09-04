@@ -9,11 +9,11 @@ test in isolation.
 The building blocks:
 
 * ``reciprocal_rank_fusion`` fuses several ranked lists (dense, sparse, one per
-  subquery) into a single ranking. It fuses on *ranks*, not raw scores, so
+  subquery) into a single ranking. It fuses on ranks, not raw scores, so
   incomparable score scales (FAISS L2 distance vs. BM25) never need
   normalization.
 * ``mmr`` re-orders a candidate set for diversity (Maximal Marginal Relevance).
-* ``dedup_records`` collapses duplicate hits of the same chunk while *keeping*
+* ``dedup_records`` collapses duplicate hits of the same chunk while keeping
   every query/subgoal that surfaced it and which signal (dense/sparse) found it.
 """
 

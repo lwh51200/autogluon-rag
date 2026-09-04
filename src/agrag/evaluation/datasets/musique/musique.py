@@ -22,8 +22,8 @@ Because the corpus is per-question, the companion
 ``local_example/benchmark_musique.py`` runner re-indexes each question's own
 ``paragraphs`` before querying -- the faithful "distractor" setting from the
 paper, where the retriever must find the few supporting paragraphs among
-distractors. These adapters mirror the ``multihop_rag`` contract (dataset row ->
-plain text / query / references / gold facts) so the same evaluation and
+distractors. These adapters follow the common dataset-adapter contract (dataset
+row -> plain text / query / references / gold facts) so the same evaluation and
 retrieval-metric utilities apply unchanged.
 """
 
@@ -55,10 +55,9 @@ def get_musique_paragraph_docs(row):
     """Build the per-question corpus: one ingest-text string per paragraph.
 
     Each paragraph becomes ``"{title}\\n\\n{paragraph_text}"`` (prepending the
-    title so lexical/semantic retrieval can match on it), mirroring
-    ``preprocess_multihop_rag_corpus``. The returned list -- supporting paragraphs
-    plus distractors -- is exactly the knowledge base indexed for this one
-    question. Empty paragraphs are skipped.
+    title so lexical/semantic retrieval can match on it). The returned list --
+    supporting paragraphs plus distractors -- is exactly the knowledge base
+    indexed for this one question. Empty paragraphs are skipped.
     """
     docs = []
     for para in row.get("paragraphs") or []:

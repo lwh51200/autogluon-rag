@@ -1,18 +1,15 @@
 """Freeze a small, reproducible slice of real MuSiQue into a self-contained JSONL.
 
-Why this exists
----------------
-The MuSiQue benchmark runner (``benchmark_musique.py``) and the backend-sweep
-evaluator (``evaluate_agentic_musique.py``) both need MuSiQue rows. Pulling the
+The MuSiQue benchmark runner (``benchmark_musique.py``) needs MuSiQue rows. Pulling the
 full ``dgslibisey/MuSiQue`` dataset from HuggingFace on every run is slow and
 requires network access, and the exact rows can drift if the mirror changes. This
-script selects a **deterministic, hop-count-stratified sample of REAL MuSiQue
-rows** once and writes them verbatim to a JSONL file, so downstream evaluation is
-offline and reproducible.
+script selects a deterministic, hop-count-stratified sample of real MuSiQue rows
+once and writes them verbatim to a JSONL file, so downstream evaluation is offline
+and reproducible.
 
-Nothing here is fabricated: each output row is a real MuSiQue example, carrying
-its full native schema so the existing adapters
-(``agrag.evaluation.datasets.musique.musique``) apply to it unchanged:
+Each output row is a real MuSiQue example, carrying its full native schema so the
+existing adapters (``agrag.evaluation.datasets.musique.musique``) apply to it
+unchanged:
 
 * ``id``                     -- hop-count is encoded in the prefix (``2hop__...``).
 * ``question`` / ``answer`` / ``answer_aliases``
@@ -115,7 +112,7 @@ def main():
     print(f"  seed={args.seed}  split={args.split}  stratify={args.stratify}  answerable_only={args.answerable_only}")
     print(f"  by hop type: {dict(sorted(type_counts.items()))}")
     print(f"  answerability: {answerable_counts}")
-    print("\nThis file is self-contained; evaluate_agentic_musique.py can now run offline against it.")
+    print("\nThis file is self-contained; benchmark_musique.py can now run offline against it.")
 
 
 if __name__ == "__main__":

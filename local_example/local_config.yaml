@@ -25,8 +25,18 @@ embedding:
   # token-level pooling must NOT run -- pool(list, "mean") would do list.mean() and
   # raise "'list' object has no attribute 'mean'". null = return embeddings as-is.
   pooling_strategy: null
-  normalize_embeddings: false   # upstream normalize_embedding() has a kwargs bug; skip it
-  normalization_params: {'p': 2, 'dim': 1, 'eps': 1e-12}
+  # Cosine end-to-end: L2-normalize both document and query vectors so the
+  # IndexFlatIP inner product below IS cosine similarity (higher = more similar).
+  # This also makes the raw ``retrieval_score`` a valid higher-is-better signal, so
+  # rank_evidence (which sorts it descending) surfaces the closest chunk first
+  # instead of the farthest -- a latent bug under the old unnormalized L2 index when
+  # the reranker is off.
+  normalize_embeddings: true
+  # NOTE: eps must be written 1.0e-12 (not 1e-12). YAML 1.1 only recognizes
+  # scientific notation as a float when it has a decimal point and a signed
+  # exponent; "1e-12" parses as a STRING, which then reaches F.normalize's
+  # clamp_min() and raises a TypeError.
+  normalization_params: {'p': 2, 'dim': 1, 'eps': 1.0e-12}
   embedding_batch_size: 32
 
 vector_db:
@@ -34,7 +44,11 @@ vector_db:
   params: {gpu: False}
   similarity_threshold: 0.95
   similarity_fn: cosine
-  faiss_index_type: IndexFlatL2
+  # Cosine via inner product on L2-normalized vectors (see normalize_embeddings
+  # above). IndexFlatIP returns higher-is-better scores, matching similarity_fn:
+  # cosine and the descending sort in rank_evidence. The dedup similarity_threshold
+  # is computed by an explicit (scale-invariant) cosine, so it is unaffected.
+  faiss_index_type: IndexFlatIP
   use_existing_vector_db: false
   save_index: true
   num_gpus: 0
@@ -50,12 +64,16 @@ retriever:
   # (retrieve_fused) still caps at retriever_top_k. Raising retriever_top_k widens
   # both. 20 pulls up to 20 dense + 20 sparse candidates per query (deduped/fused).
   retriever_top_k: 20
-  # Cross-encoder reranker DISABLED. With use_reranker: false the rerank stage of
-  # both hybrid retrieve() and agentic retrieve_fused() no-ops, and the standard
-  # path's truncate-to-reranker_top_k step disappears -- so more chunks reach the
-  # generator. reranker_top_k is now unused (kept for reference).
+  # Cross-encoder reranker default-OFF here so `benchmark_musique.py --rerank both`
+  # can run the on/off A/B on the same index without re-embedding (apply_rerank_setting
+  # toggles this in memory). With use_reranker: false the rerank stage of both hybrid
+  # retrieve() and agentic retrieve_fused() no-ops, and the standard path's
+  # truncate-to-reranker_top_k step disappears -- so more chunks reach the generator.
+  # When the reranker IS enabled it re-introduces truncate-to-reranker_top_k, so this
+  # is set >= retriever_top_k (40 vs 20) to avoid silently shrinking the generator's
+  # context relative to the reranker-off arm and confounding the comparison.
   use_reranker: false
-  reranker_top_k: 20
+  reranker_top_k: 40
   reranker_model_name: BAAI/bge-reranker-base
   reranker_model_platform: huggingface
   reranker_batch_size: 8
@@ -93,6 +111,12 @@ agent:
   # Raise the rewrite budget so "iterate more" is meaningful: only a rewrite (a new
   # query) surfaces new evidence -- re-retrieving the same query is deduped away.
   max_rewrites: 2
+  # MuSiQue is scored on short answer spans. Distill verbose/reasoning drafts into
+  # the shortest span (one extra generator call, only when the draft looks verbose).
+  extract_answer: true
+  # Let a failed verification trigger one bounded rewrite+retrieve+re-draft in the
+  # sequential-hop path (P1a). Bounded by max_rewrites above.
+  verify_retry: true
 
 generator:
   # Generator via AWS Bedrock (Claude Sonnet 4.6) for meaningful answers.

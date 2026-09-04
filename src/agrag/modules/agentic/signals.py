@@ -1,16 +1,16 @@
 """Evidence signals for the agentic policy.
 
-The ``DecisionPolicy`` used to decide purely on evidence *count*. These helpers
+The ``DecisionPolicy`` used to decide purely on evidence count. These helpers
 derive richer signals from the evidence already collected so the policy (and the
-LLM/Strands prompt) can reason about *quality*, not just quantity:
+LLM/Strands prompt) can reason about quality, not just quantity:
 
-* **Subgoal coverage** — the fraction of the planned subqueries that surfaced at
+* Subgoal coverage — the fraction of the planned subqueries that surfaced at
   least one evidence item. Low coverage means the plan was only partly answered.
-* **Relevance** — the best and mean relevance score across evidence, taken from
-  the strongest *comparable* score each item exposes (rerank > rrf). ``None`` when
+* Relevance — the best and mean relevance score across evidence, taken from
+  the strongest comparable score each item exposes (rerank > rrf). ``None`` when
   no item carries one (e.g. a retriever that returns text only, or a raw vector
   score whose direction depends on the index metric — see ``relevance_score``).
-* **Contradiction** — whether the current verification flagged the evidence as
+* Contradiction — whether the current verification flagged the evidence as
   ``conflicting_evidence``.
 
 Every field degrades gracefully: coverage is ``1.0`` when there are no subqueries,
@@ -27,17 +27,17 @@ from agrag.modules.agentic.verifier import VerificationLabel
 
 
 def relevance_score(ev: Evidence) -> Optional[float]:
-    """Return the strongest *higher-is-better* relevance score an item exposes.
+    """Return the strongest higher-is-better relevance score an item exposes.
 
     Priority mirrors the retrieval pipeline's own precedence: a cross-encoder
     ``rerank_score`` is the most trustworthy relevance signal, then the fused
-    ``rrf_score``. Both are oriented so that a larger value means *more* relevant.
+    ``rrf_score``. Both are oriented so that a larger value means more relevant.
 
     ``retrieval_score`` is deliberately excluded: it is the raw vector-DB score,
     whose direction depends on the index metric (an ``IndexFlatL2`` distance is
-    *lower*-is-better, while an inner-product index is higher-is-better), and the
+    lower-is-better, while an inner-product index is higher-is-better), and the
     evidence layer cannot tell which. Sorting or thresholding it as if higher were
-    better would surface the *worst* chunks first, so it is not used for relevance.
+    better would surface the worst chunks first, so it is not used for relevance.
     Returns ``None`` when the item carries neither a rerank nor an rrf score.
     """
     for score in (ev.rerank_score, ev.rrf_score):

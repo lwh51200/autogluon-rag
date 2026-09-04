@@ -52,8 +52,14 @@ class RetrieveTool(Tool):
         self.retriever_module = retriever_module
         self.top_k = top_k
 
-    def run(self, query: str, **kwargs) -> ToolResult:
-        records = self.retriever_module.retrieve(query, return_metadata=True, top_k=self.top_k)
+    def run(self, query: str, top_k: int = None, **kwargs) -> ToolResult:
+        # A per-call ``top_k`` overrides the tool's default so callers can widen
+        # retrieval for specific queries (e.g. the executor pulls a larger window
+        # for deep, dependency-bearing hops). ``RetrieverModule.retrieve`` already
+        # treats ``top_k=None`` as "use my configured top_k", so this is a pure
+        # pass-through when the caller does not override.
+        effective_top_k = top_k if top_k is not None else self.top_k
+        records = self.retriever_module.retrieve(query, return_metadata=True, top_k=effective_top_k)
         evidence = _records_to_evidence(records, retrieval_query=query, tool_name=self.name)
         logger.debug("%s retrieved %d chunks for %r", self.name, len(evidence), query)
         return self._result(

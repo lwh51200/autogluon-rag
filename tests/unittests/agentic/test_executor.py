@@ -94,9 +94,12 @@ class TestAgenticRAGModule(unittest.TestCase):
         answer, trace = module.answer("q", return_trace=True)
         self.assertLessEqual(trace["metrics"]["iterations"], 3)
         # The loop must terminate within budget. Under the never-refuse default a
-        # forced-abstain terminal returns a best-effort answer (status "answered");
-        # "max_iterations" is also acceptable if the cap is hit first.
-        self.assertIn(trace["status"], ("answered", "abstained", "max_iterations"))
+        # forced-abstain terminal returns a best-effort answer; when that draft was
+        # not verifier-accepted the status is "answered_unverified" (or "answered" if
+        # it was). "max_iterations" is also acceptable if the cap is hit first.
+        self.assertIn(
+            trace["status"], ("answered", "answered_unverified", "abstained", "max_iterations")
+        )
 
     def test_verification_disabled_accepts_draft(self):
         retriever = FakeRetriever(_records(3))
@@ -139,7 +142,9 @@ class TestAgenticRAGModule(unittest.TestCase):
         answer, trace = module.answer("q", return_trace=True)
         self.assertEqual(answer, "the answer")
         self.assertNotEqual(answer, DEFAULT_ABSTENTION)
-        self.assertEqual(trace["status"], "answered")
+        # The draft was returned but never verifier-accepted, so the run is marked
+        # ANSWERED_UNVERIFIED (not ANSWERED) to keep the true accept rate observable.
+        self.assertEqual(trace["status"], "answered_unverified")
 
     def test_retrieve_top_k_per_query_reaches_retriever(self):
         retriever = FakeRetriever(_records(3))
@@ -369,8 +374,8 @@ class SequentialGenerator:
 
 
 class TestSequentialHopExecutor(unittest.TestCase):
-    """Fix 1: the opt-in sequential-hop executor threads each hop's resolved
-    answer into the next hop's retrieval query."""
+    """The opt-in sequential-hop executor threads each hop's resolved answer into
+    the next hop's retrieval query."""
 
     def _module(self, retriever, gen, **overrides):
         config = {

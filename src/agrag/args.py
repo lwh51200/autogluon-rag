@@ -888,3 +888,173 @@ class Arguments:
     @agent_use_iterative_planner.setter
     def agent_use_iterative_planner(self, value):
         self.config.setdefault("agent", {})["use_iterative_planner"] = value
+
+    @property
+    def agent_extract_answer(self):
+        return self.config.get("agent", {}).get(
+            "extract_answer", self.agent_defaults.get("AGENT_EXTRACT_ANSWER")
+        )
+
+    @agent_extract_answer.setter
+    def agent_extract_answer(self, value):
+        self.config.setdefault("agent", {})["extract_answer"] = value
+
+    @property
+    def agent_verify_retry(self):
+        return self.config.get("agent", {}).get(
+            "verify_retry", self.agent_defaults.get("AGENT_VERIFY_RETRY")
+        )
+
+    @agent_verify_retry.setter
+    def agent_verify_retry(self, value):
+        self.config.setdefault("agent", {})["verify_retry"] = value
+
+    @property
+    def agent_use_hop_recovery(self):
+        return self.config.get("agent", {}).get(
+            "use_hop_recovery", self.agent_defaults.get("AGENT_USE_HOP_RECOVERY")
+        )
+
+    @agent_use_hop_recovery.setter
+    def agent_use_hop_recovery(self, value):
+        self.config.setdefault("agent", {})["use_hop_recovery"] = value
+
+    @property
+    def agent_use_replan_recovery(self):
+        return self.config.get("agent", {}).get(
+            "use_replan_recovery", self.agent_defaults.get("AGENT_USE_REPLAN_RECOVERY")
+        )
+
+    @agent_use_replan_recovery.setter
+    def agent_use_replan_recovery(self, value):
+        self.config.setdefault("agent", {})["use_replan_recovery"] = value
+
+    @property
+    def agent_max_recovery_attempts(self):
+        return self.config.get("agent", {}).get(
+            "max_recovery_attempts", self.agent_defaults.get("AGENT_MAX_RECOVERY_ATTEMPTS")
+        )
+
+    @agent_max_recovery_attempts.setter
+    def agent_max_recovery_attempts(self, value):
+        self.config.setdefault("agent", {})["max_recovery_attempts"] = value
+
+    @property
+    def agent_max_total_hops(self):
+        return self.config.get("agent", {}).get(
+            "max_total_hops", self.agent_defaults.get("AGENT_MAX_TOTAL_HOPS")
+        )
+
+    @agent_max_total_hops.setter
+    def agent_max_total_hops(self, value):
+        self.config.setdefault("agent", {})["max_total_hops"] = value
+
+    @property
+    def agent_deep_hop_top_k(self):
+        return self.config.get("agent", {}).get(
+            "deep_hop_top_k", self.agent_defaults.get("AGENT_DEEP_HOP_TOP_K")
+        )
+
+    @agent_deep_hop_top_k.setter
+    def agent_deep_hop_top_k(self, value):
+        self.config.setdefault("agent", {})["deep_hop_top_k"] = value
+
+    @property
+    def agent_deep_hop_threshold(self):
+        return self.config.get("agent", {}).get(
+            "deep_hop_threshold", self.agent_defaults.get("AGENT_DEEP_HOP_THRESHOLD")
+        )
+
+    @agent_deep_hop_threshold.setter
+    def agent_deep_hop_threshold(self, value):
+        self.config.setdefault("agent", {})["deep_hop_threshold"] = value
+
+    @property
+    def agent_use_entity_grounding(self):
+        return self.config.get("agent", {}).get(
+            "use_entity_grounding", self.agent_defaults.get("AGENT_USE_ENTITY_GROUNDING")
+        )
+
+    @agent_use_entity_grounding.setter
+    def agent_use_entity_grounding(self, value):
+        self.config.setdefault("agent", {})["use_entity_grounding"] = value
+
+    @property
+    def agent_final_answer_drop_prefix(self):
+        return self.config.get("agent", {}).get(
+            "final_answer_drop_prefix", self.agent_defaults.get("AGENT_FINAL_ANSWER_DROP_PREFIX")
+        )
+
+    @agent_final_answer_drop_prefix.setter
+    def agent_final_answer_drop_prefix(self, value):
+        self.config.setdefault("agent", {})["final_answer_drop_prefix"] = value
+
+    @property
+    def agent_use_direct_answer_fallback(self):
+        return self.config.get("agent", {}).get(
+            "use_direct_answer_fallback", self.agent_defaults.get("AGENT_USE_DIRECT_ANSWER_FALLBACK")
+        )
+
+    @agent_use_direct_answer_fallback.setter
+    def agent_use_direct_answer_fallback(self, value):
+        self.config.setdefault("agent", {})["use_direct_answer_fallback"] = value
+
+    @property
+    def agent_verifier_model(self):
+        return self.config.get("agent", {}).get(
+            "verifier_model", self.agent_defaults.get("AGENT_VERIFIER_MODEL")
+        )
+
+    @agent_verifier_model.setter
+    def agent_verifier_model(self, value):
+        self.config.setdefault("agent", {})["verifier_model"] = value
+
+    @property
+    def agent_dual_synthesis(self):
+        return self.config.get("agent", {}).get(
+            "dual_synthesis", self.agent_defaults.get("AGENT_DUAL_SYNTHESIS")
+        )
+
+    @agent_dual_synthesis.setter
+    def agent_dual_synthesis(self, value):
+        self.config.setdefault("agent", {})["dual_synthesis"] = value
+
+    @property
+    def agent_self_consistency(self):
+        return self.config.get("agent", {}).get(
+            "self_consistency", self.agent_defaults.get("AGENT_SELF_CONSISTENCY")
+        )
+
+    @agent_self_consistency.setter
+    def agent_self_consistency(self, value):
+        self.config.setdefault("agent", {})["self_consistency"] = value
+
+    @property
+    def agent_max_wall_clock_s(self):
+        return self.config.get("agent", {}).get(
+            "max_wall_clock_s", self.agent_defaults.get("AGENT_MAX_WALL_CLOCK_S")
+        )
+
+    @agent_max_wall_clock_s.setter
+    def agent_max_wall_clock_s(self, value):
+        self.config.setdefault("agent", {})["max_wall_clock_s"] = value
+
+    @property
+    def agent_max_llm_calls(self):
+        return self.config.get("agent", {}).get(
+            "max_llm_calls", self.agent_defaults.get("AGENT_MAX_LLM_CALLS")
+        )
+
+    @agent_max_llm_calls.setter
+    def agent_max_llm_calls(self, value):
+        self.config.setdefault("agent", {})["max_llm_calls"] = value
+
+    @property
+    def agent_max_retrieval_calls(self):
+        return self.config.get("agent", {}).get(
+            "max_retrieval_calls", self.agent_defaults.get("AGENT_MAX_RETRIEVAL_CALLS")
+        )
+
+    @agent_max_retrieval_calls.setter
+    def agent_max_retrieval_calls(self, value):
+        self.config.setdefault("agent", {})["max_retrieval_calls"] = value

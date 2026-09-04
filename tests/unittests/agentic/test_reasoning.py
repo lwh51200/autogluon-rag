@@ -137,13 +137,15 @@ class TestAnswerVerifier(unittest.TestCase):
 
     def test_partial_label_parsed_distinctly(self):
         # "partially_supported" must parse to its own label (not be greedily
-        # matched as the shorter "supported"). It is an acceptable label, so
-        # is_supported is True (see AnswerVerifier._ACCEPTABLE_LABELS).
+        # matched as the shorter "supported"). Verification is now tightened so only
+        # "supported" accepts: partially_supported parses distinctly but is NOT
+        # supported (see AnswerVerifier._ACCEPTABLE_LABELS), so it routes through
+        # recovery/re-verify rather than being accepted.
         gen = FakeGenerator("This is partially_supported by the evidence.")
         verifier = AnswerVerifier(gen, min_evidence_count=1)
         result = verifier.verify("q", "draft", _store("a"))
         self.assertEqual(result["label"], "partially_supported")
-        self.assertTrue(result["is_supported"])
+        self.assertFalse(result["is_supported"])
 
     def test_unparseable_defaults_to_unsupported(self):
         # A reply with no recognizable label token is treated as a rejection: a
@@ -175,6 +177,50 @@ class TestAnswerVerifier(unittest.TestCase):
         result = verifier.verify("q", "draft", _store("a big first chunk with many words"))
         self.assertEqual(result["label"], "supported")
         self.assertIn("a big first chunk with many words", gen.prompts[0])
+
+    def test_non_answer_forced_unsupported_without_model_call(self):
+        # A refusal/hedge draft is never supported and must not even call the model.
+        gen = FakeGenerator("supported")
+        verifier = AnswerVerifier(gen, min_evidence_count=1)
+        result = verifier.verify(
+            "q", "The question cannot be answered because the city is unknown.", _store("a", "b")
+        )
+        self.assertEqual(result["label"], "unsupported")
+        self.assertFalse(result["is_supported"])
+        self.assertEqual(gen.prompts, [])  # model not called
+
+    def test_empty_answer_forced_unsupported(self):
+        gen = FakeGenerator("supported")
+        verifier = AnswerVerifier(gen, min_evidence_count=1)
+        result = verifier.verify("q", "   ", _store("a", "b"))
+        self.assertEqual(result["label"], "unsupported")
+        self.assertEqual(gen.prompts, [])
+
+    def test_hop_chain_included_in_prompt(self):
+        gen = FakeGenerator("supported")
+        verifier = AnswerVerifier(gen, min_evidence_count=1)
+        hops = [
+            {"subquery": "Who is X's father?", "answer": "Gobind Singh"},
+            {"subquery": "Who is #1's father?", "answer": "Tegh Bahadur"},
+        ]
+        verifier.verify("q", "Tegh Bahadur", _store("a", "b"), hop_answers=hops)
+        prompt = gen.prompts[0]
+        self.assertIn("RESOLVED REASONING CHAIN", prompt)
+        self.assertIn("Who is X's father? -> Gobind Singh", prompt)
+
+    def test_anchor_pulls_supporting_chunk_into_bounded_window(self):
+        # The chunk that grounds the answer was retrieved LAST (insertion order
+        # would truncate it under a tight budget). Anchoring on the draft answer
+        # must surface it into the verifier window regardless of position.
+        gen = FakeGenerator("supported")
+        verifier = AnswerVerifier(gen, min_evidence_count=2, max_context_tokens=6)
+        store = EvidenceStore()
+        store.add(Evidence(text="distractor one two three", doc_id=0, chunk_id=0))
+        store.add(Evidence(text="distractor four five six", doc_id=0, chunk_id=1))
+        store.add(Evidence(text="the answer is Tegh Bahadur", doc_id=0, chunk_id=2))
+        verifier.verify("q", "Tegh Bahadur", store)
+        prompt = gen.prompts[0]
+        self.assertIn("Tegh Bahadur", prompt)
 
 
 class TestDecisionPolicy(unittest.TestCase):
@@ -267,10 +313,13 @@ class TestDecisionPolicy(unittest.TestCase):
         # Accept on the is_supported boolean...
         self.assertTrue(policy.accept_verification({"label": "supported", "is_supported": True}))
         self.assertTrue(policy.accept_verification({"is_supported": True}))
-        # ...and also on the label, so a partially_supported answer is accepted
-        # even if a caller left is_supported unset/False (the verifier now sets
-        # is_supported True for it, but the label path is the contract).
-        self.assertTrue(policy.accept_verification({"label": "partially_supported", "is_supported": False}))
+        # ...and also on the label path: a "supported" label accepts even if a caller
+        # left is_supported unset/False.
+        self.assertTrue(policy.accept_verification({"label": "supported", "is_supported": False}))
+        # Tightened: partially_supported is NO LONGER accepted on the label path -- it
+        # routes through recovery/re-verify. (The is_supported=True short-circuit
+        # still accepts, but the verifier no longer sets that for a partial label.)
+        self.assertFalse(policy.accept_verification({"label": "partially_supported", "is_supported": False}))
         self.assertTrue(policy.accept_verification({"label": "partially_supported", "is_supported": True}))
         # Everything else is rejected.
         self.assertFalse(policy.accept_verification({"label": "unsupported", "is_supported": False}))

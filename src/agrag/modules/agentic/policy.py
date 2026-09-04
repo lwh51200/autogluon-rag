@@ -4,20 +4,20 @@ The ``DecisionPolicy`` decides the next action: retrieve more evidence, rewrite
 the query, compress context, draft an answer, or abstain. It is driven by the
 current ``AgentState`` and the collected evidence.
 
-Unlike a fixed pipeline, the policy *reacts to observations*: it retrieves again
+Unlike a fixed pipeline, the policy reacts to observations: it retrieves again
 after a query rewrite, and it changes course when a draft fails verification
 (rewriting to gather better evidence rather than re-drafting the same answer).
 
 Three modes are supported, in precedence order Strands > LLM > rule-based:
 
-* **Rule-based** (default): a deterministic priority ordering picks the next
+* Rule-based (default): a deterministic priority ordering picks the next
   action from the set of currently-legal actions.
-* **LLM-backed** (opt-in via ``use_llm`` + a ``generator_module``): the LLM
-  *chooses among the legal actions* the deterministic guardrails allow. The LLM
+* LLM-backed (opt-in via ``use_llm`` + a ``generator_module``): the LLM
+  chooses among the legal actions the deterministic guardrails allow. The LLM
   returns only a validated action enum; the arguments for each action are
   assembled deterministically here, so the model can never emit a query string
   or tool argument that breaks the executor.
-* **Strands-backed** (opt-in via a ``strands_backend``): a Strands agent driving
+* Strands-backed (opt-in via a ``strands_backend``): a Strands agent driving
   Bedrock Sonnet 4.6 chooses among the legal actions, constrained to that exact
   set by a JSON-schema enum (Pydantic structured output). It too returns only an
   action value; ``_build_args`` still assembles arguments deterministically.
@@ -108,7 +108,7 @@ class DecisionPolicy:
         and compression is enabled, the policy compresses before drafting.
     min_subgoal_coverage : float
         Minimum fraction of planned subqueries that must have supporting evidence
-        before drafting is the *preferred* action. When coverage is below this and
+        before drafting is the preferred action. When coverage is below this and
         a rewrite is still in budget, the policy prefers a rewrite to fill the gap.
         Only bites when the plan has subqueries; drafting is never removed, so the
         loop still terminates.
@@ -119,13 +119,13 @@ class DecisionPolicy:
         score-less retriever never blocks drafting.
     max_rewrites : int
         Upper bound on query rewrites within a single run. This is the primary
-        knob for how much the agent may *iterate* to surface new evidence: because
+        knob for how much the agent may iterate to surface new evidence: because
         re-retrieving the same query is deduplicated to nothing, only a rewrite (a
         new query) can add evidence. Defaults to 2.
     allow_abstention : bool
         Opt-in switch for refusing to answer. When False (the default) ABSTAIN is
         never offered as one of several fork options — so the LLM/Strands policy
-        can never *choose* to give up over iterating — and survives only as a
+        can never choose to give up over iterating — and survives only as a
         forced sole terminal (no rewrite budget and no new evidence), which the
         executor converts into a best-effort answer. When True the original
         behavior is restored: ABSTAIN is offered as a fallback alongside
@@ -133,7 +133,7 @@ class DecisionPolicy:
     max_iterations : Optional[int]
         The executor's loop budget. When set, the policy will not choose to
         rewrite the query on the final iteration: a rewrite is only useful if
-        there is budget left to re-retrieve *and* re-draft afterwards. Rewriting
+        there is budget left to re-retrieve and re-draft afterwards. Rewriting
         with no remaining budget guarantees an abstention and wastes an LLM call.
         When None, the policy assumes budget is always available (legacy
         behavior).
@@ -190,14 +190,14 @@ class DecisionPolicy:
 
     @property
     def _fork_decider_enabled(self) -> bool:
-        """Whether *some* model backend can choose among legal actions at a fork."""
+        """Whether some model backend can choose among legal actions at a fork."""
         return self.strands_backend is not None or self._llm_enabled
 
     def _rewrite_count(self, state: AgentState) -> int:
         return sum(1 for r in state.history if r.action_type == ActionType.REWRITE_QUERY.value)
 
     def _has_retrieved(self, state: AgentState) -> bool:
-        """Whether *any* retrieval has run this run (regardless of query)."""
+        """Whether any retrieval has run this run (regardless of query)."""
         return any(
             r.action_type in (ActionType.RETRIEVE.value, ActionType.MULTI_RETRIEVE.value) for r in state.history
         )
@@ -220,6 +220,17 @@ class DecisionPolicy:
             and self._rewrite_count(state) < self.max_rewrites
             and self._rewrite_has_budget(state)
         )
+
+    def _can_rewrite_posthoc(self, state: AgentState) -> bool:
+        """Whether another rewrite is allowed for a post-loop verify-retry.
+
+        Unlike ``_can_rewrite``, this drops the ``_rewrite_has_budget`` iteration
+        gate: it is used by the sequential-hop path's verify-retry, which runs after
+        the hop loop has finished, so the number of main-loop iterations left is
+        irrelevant. The retry is still bounded by ``max_rewrites`` (each pass
+        records a rewrite action), so it always terminates.
+        """
+        return self.use_query_rewrite and self._rewrite_count(state) < self.max_rewrites
 
     def _last_draft_failed(self, state: AgentState) -> bool:
         """True when the most recent draft was verified and rejected.
@@ -278,7 +289,7 @@ class DecisionPolicy:
 
         Note: in the normal loop a contradiction (``conflicting_evidence``) also
         sets ``is_supported=False`` on a draft, which routes through the
-        draft-failed guardrail *before* this branch-5 check is reached. The
+        draft-failed guardrail before this branch-5 check is reached. The
         contradiction term is kept as a defensive guard so this predicate stays
         correct if it is ever consulted from a state without a failed draft.
         """
@@ -322,12 +333,12 @@ class DecisionPolicy:
 
         The guardrails mirror the original rule cascade so the LLM can never pick
         an illegal or wasteful action; within those bounds, most branches expose a
-        genuine fork so the LLM policy has real agency. **The first element of
-        every returned list is the deterministic (rule-based) choice**, so a
+        genuine fork so the LLM policy has real agency. The first element of
+        every returned list is the deterministic (rule-based) choice, so a
         rule-based policy (``use_llm`` off) reproduces the original behavior
         exactly.
 
-        1. If nothing has been retrieved for the *current* query, retrieval is
+        1. If nothing has been retrieved for the current query, retrieval is
            forced (multi on the first retrieval when the plan has subqueries, else
            single). No fork: drafting before any evidence is never allowed, and
            choosing single over multi at the start has little upside for a
@@ -339,14 +350,14 @@ class DecisionPolicy:
            below the evidence floor is never legal (the verifier would
            short-circuit to insufficient_evidence).
         3. If the latest draft failed verification: when new evidence has arrived
-           since that draft, re-drafting can now succeed, so draft OR rewrite
+           since that draft, re-drafting can now succeed, so draft or rewrite
            (draft first, the default). When no new evidence has arrived, re-drafting
            would only reproduce the rejected answer, so rewrite (when allowed);
            otherwise abstain. When ``allow_abstention`` is set, abstain is also
            offered as a discretionary fallback in each of these forks (as before).
         4. If context compression is enabled and the evidence exceeds the token
-           budget: compress oversized context first OR draft now.
-        5. Otherwise (enough evidence, nothing failing): draft the answer OR, when
+           budget: compress oversized context first or draft now.
+        5. Otherwise (enough evidence, nothing failing): draft the answer or, when
            a rewrite is still in budget, rewrite to seek stronger evidence before
            answering. Draft is the default, but when the evidence looks weak
            (incomplete subgoal coverage, low relevance, or a contradiction) the
@@ -379,7 +390,7 @@ class DecisionPolicy:
             # would only reproduce the rejected answer, so fall back to a rewrite to
             # gather better evidence. ABSTAIN keeps the loop terminating: in
             # never-refuse mode it is only the forced sole terminal (no new evidence
-            # AND no rewrite budget), never a discretionary option; in refuse mode
+            # and no rewrite budget), never a discretionary option; in refuse mode
             # it is offered as the fallback alongside draft/rewrite, as before.
             if self._new_evidence_since_last_draft(state):
                 if self._can_rewrite(state):
@@ -488,7 +499,7 @@ class DecisionPolicy:
     ) -> str:
         """Build a compact state summary + described allowed-action list for the LLM.
 
-        The summary surfaces evidence *quality* (subgoal coverage, best/mean
+        The summary surfaces evidence quality (subgoal coverage, best/mean
         relevance, contradiction) and short snippets of the strongest evidence, so
         the model reasons over the actual context rather than a bare count.
         """
@@ -590,17 +601,14 @@ class DecisionPolicy:
     def accept_verification(self, verification: Dict[str, Any]) -> bool:
         """Whether a verification result is good enough to return the answer.
 
-        C1a ablation: accept both ``supported`` and ``partially_supported`` labels
-        (rather than gating solely on the verifier's ``is_supported`` boolean, which
-        is True only for ``supported``). ``conflicting_evidence``, ``unsupported``
-        and ``insufficient_evidence`` are still rejected and route through
-        rewrite/abstain. The executor's "unverified" path sets ``is_supported`` True
-        (with no label), so verification-off runs still accept.
+        Only ``supported`` is accepted. ``partially_supported`` now joins
+        ``conflicting_evidence``, ``unsupported`` and ``insufficient_evidence`` in
+        being rejected, so it routes through rewrite/recovery + re-verification
+        rather than being returned as verified. The executor's "unverified" path
+        sets ``is_supported`` True (with no label), so verification-off runs still
+        accept.
         """
         verification = verification or {}
         if verification.get("is_supported", False):
             return True
-        return verification.get("label") in (
-            VerificationLabel.SUPPORTED.value,
-            VerificationLabel.PARTIALLY_SUPPORTED.value,
-        )
+        return verification.get("label") == VerificationLabel.SUPPORTED.value

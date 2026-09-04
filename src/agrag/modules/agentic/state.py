@@ -1,6 +1,6 @@
 """Per-query runtime state for the agentic RAG path.
 
-``AgentState`` holds everything the agent loop needs for a *single* query: the
+``AgentState`` holds everything the agent loop needs for a single query: the
 original and current query text, the retrieval plan and subqueries, the running
 log of actions/observations, evidence ids, the draft answer, the verification
 result, the iteration count, and the final status. It is intentionally
@@ -18,11 +18,36 @@ from agrag.constants import LOGGER_NAME
 logger = logging.getLogger(LOGGER_NAME)
 
 
+class Reason(str, Enum):
+    """Machine-readable reason a hop or a final answer is unresolved/unverified.
+
+    Attached to ``hop_answers`` entries (per hop) and to ``AgentState.unverified_reason``
+    (the run's final disposition) so the trace/benchmark can distinguish why a hop
+    grounded to UNKNOWN or why a returned answer is ``ANSWERED_UNVERIFIED`` -- rather
+    than collapsing every failure into one opaque state. Reasons are informational
+    for now; they do not yet steer differentiated recovery routing.
+    """
+
+    NO_EVIDENCE = "no_evidence"  # retrieval returned nothing usable for the hop
+    RETRIEVAL_FAILED = "retrieval_failed"  # the retrieval tool raised/failed
+    AMBIGUOUS = "ambiguous"  # multiple conflicting candidates (reserved)
+    DEPENDENCY_UNRESOLVED = "dependency_unresolved"  # a prerequisite hop was UNKNOWN / a #n ref was invalid
+    BUDGET_EXHAUSTED = "budget_exhausted"  # a time/call budget tripped before support was reached
+    UNSUPPORTED = "unsupported"  # a draft was produced but verification rejected it
+
+
 class AgentStatus(str, Enum):
     """Terminal or in-progress status of an agentic run."""
 
     IN_PROGRESS = "in_progress"
     ANSWERED = "answered"
+    # A best-effort answer returned when the run could not obtain an accepted
+    # verification (never-refuse mode: iteration/recovery was exhausted and the
+    # last verification was rejected or absent). Distinguished from ``ANSWERED``
+    # so the true verified-accept rate is observable in the trace/benchmark. Both
+    # count as "answered" for the answered-vs-abstained distinction -- use a
+    # membership check, not ``== ANSWERED``.
+    ANSWERED_UNVERIFIED = "answered_unverified"
     ABSTAINED = "abstained"
     MAX_ITERATIONS = "max_iterations"
 
@@ -47,7 +72,7 @@ class ActionRecord:
         How many new (non-duplicate) evidence items this step contributed.
     query : str
         The working query in effect when this step ran. Lets the policy tell
-        whether retrieval has already happened for the *current* query (so a
+        whether retrieval has already happened for the current query (so a
         rewrite triggers fresh retrieval rather than dead-ending).
     """
 
@@ -84,7 +109,7 @@ class AgentState:
     draft_answer : Optional[str]
         The most recent draft answer, if one has been synthesized.
     verification : Optional[Dict[str, Any]]
-        The most recent verification result (label + details) for the *current*
+        The most recent verification result (label + details) for the current
         query. Reset to None on a rewrite so a stale rejection does not keep
         forcing rewrites. Use ``last_verification`` for debugging/trace instead.
     last_verification : Optional[Dict[str, Any]]
@@ -104,6 +129,38 @@ class AgentState:
         after prior hops' answers were substituted in. Empty on the parallel path.
     iteration : int
         Current loop iteration (0-based).
+    recovery_attempts : int
+        Number of whole-plan re-decomposition recovery passes taken by the
+        sequential-hop executor (``use_replan_recovery``). Tracked separately from
+        ``iteration`` because a recovery pass re-runs the hop loop and must not be
+        blocked by (nor consume) the ``max_iterations`` budget, which also gates the
+        default bounded loop. 0 on every other path.
+    hop_recovery_attempts : int
+        Number of local (in-plan) hop-recovery passes taken by the sequential-hop
+        executor (``use_hop_recovery``) -- the extra hypothesized-seed retrieval
+        issued when a hop grounds to UNKNOWN. Tracked separately from ``iteration``
+        so local recovery (execution-failure repair) does not draw down the budget
+        that gates verify-retry (evidence/support repair); the two fix different
+        failure modes and must not compete for one counter. Local recovery is
+        naturally bounded to one pass per UNKNOWN hop. 0 on every other path.
+    retrieval_failures : int
+        Number of retrieval-tool exceptions swallowed during this run (e.g. a hop
+        or rewrite retrieval that threw). The first such failure per run is logged
+        at WARNING so a systematic retriever error is distinguishable from the
+        benign "retrieved but found nothing" case; subsequent failures stay at
+        DEBUG to avoid log spam.
+    llm_calls : int
+        Number of generator (LLM) calls made during this run, counted for the
+        ``max_llm_calls`` budget. Incremented by the executor around each
+        synthesis/verification/rewrite/hop generation.
+    retrieval_calls : int
+        Number of retrieval-tool invocations made during this run, counted for the
+        ``max_retrieval_calls`` budget (both successful and failed attempts).
+    unverified_reason : Optional[str]
+        When the run returns a best-effort answer tagged ``ANSWERED_UNVERIFIED``,
+        the ``Reason`` value explaining why (e.g. ``unsupported``,
+        ``budget_exhausted``, ``dependency_unresolved``). ``None`` for a verified
+        ``ANSWERED`` run or an abstention.
     status : AgentStatus
         Current status of the run.
     """
@@ -120,6 +177,12 @@ class AgentState:
     compressed_context: Optional[str] = None
     hop_answers: List[Dict[str, str]] = field(default_factory=list)
     iteration: int = 0
+    recovery_attempts: int = 0
+    hop_recovery_attempts: int = 0
+    retrieval_failures: int = 0
+    llm_calls: int = 0
+    retrieval_calls: int = 0
+    unverified_reason: Optional[str] = None
     status: AgentStatus = AgentStatus.IN_PROGRESS
 
     def __post_init__(self) -> None:
@@ -226,5 +289,11 @@ class AgentState:
             "compressed_context": self.compressed_context,
             "hop_answers": [dict(h) for h in self.hop_answers],
             "iteration": self.iteration,
+            "recovery_attempts": self.recovery_attempts,
+            "hop_recovery_attempts": self.hop_recovery_attempts,
+            "retrieval_failures": self.retrieval_failures,
+            "llm_calls": self.llm_calls,
+            "retrieval_calls": self.retrieval_calls,
+            "unverified_reason": self.unverified_reason,
             "status": self.status.value,
         }

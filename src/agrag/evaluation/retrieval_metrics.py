@@ -1,7 +1,7 @@
 """Retrieval-quality metrics for RAG evaluation (Hit@k, MRR, evidence coverage).
 
 Answer exact-match tells you whether the final text was right; it does not tell
-you whether the *retriever* surfaced the passages needed to get there. On a
+you whether the retriever surfaced the passages needed to get there. On a
 multi-hop benchmark that distinction is the whole point: the static-vs-agentic
 gap shows up first in retrieval, because the agentic path issues multiple
 sub-queries and accumulates evidence across rounds. These metrics score the
@@ -10,21 +10,21 @@ retrieved passages against the benchmark's gold supporting facts.
 Matching heuristic
 ------------------
 Gold relevance in MultiHop-RAG is a set of ``fact`` snippets (sentences taken
-from corpus articles). The pipeline retrieves fixed-size *chunks* (e.g. 128
+from corpus articles). The pipeline retrieves fixed-size chunks (e.g. 128
 tokens), so a gold fact almost never equals a retrieved chunk verbatim. A gold
 fact is therefore counted as "retrieved" by a chunk when most of the fact's
-content tokens appear in that chunk -- token *containment* above a threshold
+content tokens appear in that chunk -- token containment above a threshold
 (default 0.6). This is deliberately lenient on chunk boundaries but strict on
 content, which is the right trade-off for chunked retrieval.
 
 Sentence-level gold units
 -------------------------
-MuSiQue's gold "facts" are frequently whole *paragraphs*, not single sentences.
+MuSiQue's gold "facts" are frequently whole paragraphs, not single sentences.
 A 294-token gold paragraph can never place 60% of its content tokens inside a
 single ~131-token chunk, so paragraph-level containment structurally under-counts
 long facts -- the supporting sentence is retrieved, yet the fact scores as a miss.
-To fix that lower bound, each gold fact is split into sentence *units* and the
-fact is counted as retrieved when *any* one of its sentences clears the
+To fix that lower bound, each gold fact is split into sentence units and the
+fact is counted as retrieved when any one of its sentences clears the
 containment bar against a retrieved chunk. A sentence fits in a chunk; a
 paragraph does not. A fact with no sentence boundary is treated as a single unit,
 so short single-sentence facts behave exactly as before.
@@ -92,7 +92,7 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 # Sentence boundary: terminal punctuation (. ! ?) followed by whitespace. Kept
 # deliberately simple (stdlib regex, no NLP dependency) -- over-splitting is
 # harmless here because each unit is matched independently and the fact counts as
-# retrieved if ANY unit clears the bar.
+# retrieved if any unit clears the bar.
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -134,7 +134,7 @@ def _unit_is_retrieved(unit: str, chunk_text: str, threshold: float) -> bool:
 
 
 def fact_is_retrieved(fact: str, chunk_text: str, threshold: float = 0.6) -> bool:
-    """True if ``chunk_text`` contains enough of ANY of ``fact``'s sentence units.
+    """True if ``chunk_text`` contains enough of any of ``fact``'s sentence units.
 
     The fact is split into sentence units (``_gold_units``); it counts as
     retrieved when any single unit clears the containment threshold against the
@@ -146,7 +146,7 @@ def fact_is_retrieved(fact: str, chunk_text: str, threshold: float = 0.6) -> boo
 
 
 def _first_hit_rank(retrieved_texts: List[str], gold_facts: List[str], threshold: float) -> int:
-    """1-indexed rank of the first retrieved chunk matching ANY gold fact, else 0."""
+    """1-indexed rank of the first retrieved chunk matching any gold fact, else 0."""
     for rank, chunk in enumerate(retrieved_texts, start=1):
         if any(fact_is_retrieved(fact, chunk, threshold) for fact in gold_facts):
             return rank
@@ -154,7 +154,7 @@ def _first_hit_rank(retrieved_texts: List[str], gold_facts: List[str], threshold
 
 
 def _evidence_coverage(retrieved_texts: List[str], gold_facts: List[str], threshold: float) -> float:
-    """Fraction of DISTINCT gold facts matched by at least one retrieved chunk.
+    """Fraction of distinct gold facts matched by at least one retrieved chunk.
 
     This is the multi-hop-specific signal: a single-shot retriever may nail one
     hop (coverage ~= 1/n) while missing the others; a multi-round agentic
@@ -169,11 +169,11 @@ def _evidence_coverage(retrieved_texts: List[str], gold_facts: List[str], thresh
 
 
 def _recall_at_k(retrieved_texts: List[str], gold_facts: List[str], k: int, threshold: float) -> float:
-    """Fraction of DISTINCT gold facts covered within the top-``k`` retrieved chunks.
+    """Fraction of distinct gold facts covered within the top-``k`` retrieved chunks.
 
     This is ``_evidence_coverage`` restricted to a cutoff: unlike ``hit@k`` (which
-    is 1.0 as soon as *any* single gold fact appears), recall@k rewards covering
-    *more* of the required facts within the first ``k`` results -- the signal that
+    is 1.0 as soon as any single gold fact appears), recall@k rewards covering
+    more of the required facts within the first ``k`` results -- the signal that
     separates a multi-hop retriever from a single-shot one at a fixed budget.
     """
     return _evidence_coverage(retrieved_texts[:k], gold_facts, threshold)

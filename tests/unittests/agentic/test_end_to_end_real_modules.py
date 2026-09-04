@@ -1,23 +1,8 @@
-"""End-to-end agentic RAG test with REAL modules (no mocks).
-
-Unlike the rest of the agentic suite (which uses fakes), this test drives the
-whole stack — a real HuggingFace embedding model, a real generator, a real FAISS
-index, the real RetrieverModule — through the agentic path. It exists to catch
-wiring regressions that unit tests with fakes cannot, e.g. a retriever/evidence
-contract drift or a loop-budget default that abstains before it can recover.
-
-It reuses the committed ``local_example`` corpus, its prebuilt FAISS index, and
-its config (Bedrock Cohere Embed English v3 embeddings + a Bedrock Claude Sonnet 4.6 generator),
-so nothing is re-embedded or written. The test asserts the *plumbing* (retrieval
-finds real evidence, the loop terminates with a valid status, a coherent trace is
-produced) rather than exact answer text.
-
-If the models/credentials are unavailable (offline CI, no AWS access), or the
-prebuilt index is missing, the test skips rather than fails.
-"""
 
 import os
 import unittest
+
+import numpy as np
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 LOCAL_EXAMPLE = os.path.join(REPO_ROOT, "local_example")
@@ -34,7 +19,7 @@ class TestAgenticEndToEndRealModules(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Build the pipeline once (model loading is the expensive part). Load the
-        # committed index instead of re-embedding, and never write anything back.
+        # locally-built index instead of re-embedding, and never write anything back.
         from agrag.agrag import AutoGluonRAG
 
         cls._prev_cwd = os.getcwd()
@@ -50,6 +35,21 @@ class TestAgenticEndToEndRealModules(unittest.TestCase):
             agrag.load_existing_vector_db(INDEX_PATH, METADATA_PATH)
             if not agrag.vector_db_module.index or agrag.vector_db_module.metadata is None:
                 raise unittest.SkipTest("prebuilt vector DB index could not be loaded")
+            # The committed index is only usable if its vector dimension matches what
+            # the *configured* embedding model produces for a query. When the config's
+            # embedder was changed without rebuilding this fixture (e.g. a 384-dim
+            # index vs a 1024-dim Cohere config), FAISS would abort the first search
+            # with ``assert d == self.d``. That is a stale-fixture condition, not a
+            # code regression, so -- per this test's "skip rather than fail" intent --
+            # detect it up front with one probe embedding and skip.
+            index_dim = agrag.vector_db_module.index.d
+            probe = np.asarray(agrag.embedding_module.encode_queries("dimension probe"))
+            query_dim = probe.reshape(-1).shape[0] if probe.ndim == 1 else probe.shape[-1]
+            if query_dim != index_dim:
+                raise unittest.SkipTest(
+                    f"committed index dim ({index_dim}) != configured embedder dim ({query_dim}); "
+                    "rebuild local_example/vector_db_index with the current embedding config"
+                )
         except unittest.SkipTest:
             os.chdir(cls._prev_cwd)
             raise

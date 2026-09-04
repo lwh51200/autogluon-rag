@@ -33,13 +33,30 @@ You can now use the package in two ways.
 AutoGluon-RAG
 
 
-usage: agrag [-h] --config_file
+usage: agrag [-h] [--config_file] [--preset_quality] [--web_urls [...]]
+             [--base_urls [...]] [--parse_urls_recursive] [--data_dir]
+             [--mode {standard,agentic}]
 
 AutoGluon-RAG - Retrieval-Augmented Generation Pipeline
 
 options:
-  -h, --help        show this help message and exit
-  --config_file        Path to the configuration file 
+  -h, --help            show this help message and exit
+  --config_file         Path to the configuration file
+  --preset_quality      Preset quality settings for the RAG pipeline
+                        (default: medium_quality)
+  --web_urls [ ...]     List of URLs to use for RAG
+  --base_urls [ ...]    List of base URLs to restrict web URL parsing.
+                        Only URLs stemming from a base URL will be processed.
+  --parse_urls_recursive
+                        Enable recursive parsing of all URLs from the
+                        provided web URL list
+  --data_dir            Directory containing files to use for RAG.
+                        Supports local or S3 paths.
+  --mode {standard,agentic}
+                        Answering mode: 'standard' (single-pass RAG) or
+                        'agentic' (multi-step planning/verification). If
+                        omitted, the agent.default_mode / agent.enabled
+                        config values decide.
 ```
 
 ### Use AutoGluon-RAG through code:
@@ -66,12 +83,12 @@ if __name__ == "__main__":
 ### Agentic RAG (optional)
 
 In addition to the standard single-pass pipeline (retrieve → generate), AutoGluon-RAG
-provides an optional **agentic RAG** path. Instead of answering in one shot, the agent
+provides an optional agentic RAG path. Instead of answering in one shot, the agent
 runs a short, bounded reasoning loop that can plan subqueries, retrieve for each of them,
 rewrite the query when retrieval is weak, verify that the draft answer is supported by the
-retrieved evidence, and **abstain** when the evidence is insufficient rather than
-hallucinate. The agentic path reuses the same retriever and generator as the standard
-pipeline — no re-ingesting, re-chunking, or re-embedding is performed.
+retrieved evidence, and abstain when the evidence is insufficient. The agentic path reuses
+the same retriever and generator as the standard pipeline; it does not re-ingest or
+re-embed your documents.
 
 The standard path remains the default. Enable the agentic path per call:
 
@@ -98,8 +115,11 @@ agrag --mode agentic
 ```
 
 You can also make agentic the default by setting the `agent` block in your config file
-(`enabled: true` or `default_mode: agentic`). The full set of agent parameters and their
-defaults lives in `src/agrag/configs/agent/default.yaml`:
+(`enabled: true` or `default_mode: agentic`). The commonly used parameters are shown below.
+The full set of agent parameters (including many advanced multi-hop knobs not shown here)
+and their defaults lives in `src/agrag/configs/agent/default.yaml`. Note that the defaults
+file uses uppercase, flat keys (e.g. `AGENT_ENABLED`, `AGENT_MAX_ITERATIONS`), while a user
+config file uses the lowercase, nested `agent:` block shown here (`enabled`, `max_iterations`, ...):
 
 ```yaml
 agent:
@@ -116,7 +136,7 @@ agent:
   return_trace: false       # return (answer, trace) instead of just answer
 ```
 
-A runnable example over local documents lives in `local_example/`. It uses AWS Bedrock Cohere Embed English v3 embeddings, a HuggingFace reranker on CPU, and an AWS Bedrock Claude Sonnet 4.6 generator by default (credentials via the standard AWS chain); swap the generator in `local_example/local_config.yaml` for a local HuggingFace model to run without cloud credentials.
+A runnable example over local documents lives in `local_example/`. It uses AWS Bedrock Cohere Embed English v3 embeddings and an AWS Bedrock Claude Sonnet 4.6 generator by default (credentials via the standard AWS chain); a HuggingFace reranker (`BAAI/bge-reranker-base`) is configured but disabled (`use_reranker: false`) in that example. Swap the generator in `local_example/local_config.yaml` for a local HuggingFace model to run without cloud credentials.
 
 For a list of configurable parameters that can be passed into the `AutoGluonRAG` class, refer to the tutorial [here](https://github.com/autogluon/autogluon-rag/tree/main/docs/tutorials/general/code_parameters.md). 
 

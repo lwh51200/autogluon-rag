@@ -16,6 +16,34 @@ from agrag.constants import LOGGER_NAME
 logger = logging.getLogger(LOGGER_NAME)
 
 
+def _max_opt(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    """Max of two optional (higher-is-better) scores, ignoring ``None``."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return max(a, b)
+
+
+def _min_opt(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    """Min of two optional (lower-is-better) positions, ignoring ``None``."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return min(a, b)
+
+
+def _min_rank(a: int, b: int) -> int:
+    """Best (min) of two ranks. ``-1`` is the "unset" sentinel and loses to any
+    real (>= 0) rank; when both are unset the sentinel is preserved."""
+    if a is None or a < 0:
+        return b if b is not None else a
+    if b is None or b < 0:
+        return a
+    return min(a, b)
+
+
 @dataclass
 class Evidence:
     """A single piece of retrieved evidence.
@@ -99,18 +127,30 @@ class Evidence:
         return self.evidence_id or "unknown"
 
     def merge_provenance(self, other: "Evidence") -> None:
-        """Fold another duplicate's query provenance into this item.
+        """Fold another duplicate's query provenance and best score into this item.
 
-        Keeps this item's rank/scores (the first occurrence is authoritative) but
-        unions the set of queries that surfaced the chunk into ``retrieval_queries``
-        so subgoal-coverage signals credit every subquery that found it. The order
-        of first appearance is preserved.
+        Unions the set of queries that surfaced the chunk into ``retrieval_queries``
+        (order of first appearance preserved) so subgoal-coverage signals credit
+        every subquery that found it. In addition, keeps the best score seen across
+        both occurrences rather than the first: the higher-is-better similarity
+        scores (``retrieval_score`` under the normalized inner-product metric,
+        ``rerank_score``, ``rrf_score``) take the ``max``, and the lower-is-better
+        positions (``rank``, ``fusion_rank``) take the ``min``. A chunk re-retrieved
+        by a stronger query then ranks by its strongest evidence rather than by
+        whichever query happened to surface it first.
         """
         merged = list(self.retrieval_queries)
         for query in [self.retrieval_query] + [other.retrieval_query] + list(other.retrieval_queries):
             if query and query not in merged:
                 merged.append(query)
         self.retrieval_queries = merged
+        # Higher-is-better similarity scores: keep the max seen (ignoring None).
+        self.retrieval_score = _max_opt(self.retrieval_score, other.retrieval_score)
+        self.rerank_score = _max_opt(self.rerank_score, other.rerank_score)
+        self.rrf_score = _max_opt(self.rrf_score, other.rrf_score)
+        # Lower-is-better positions: keep the best (min) non-negative rank seen.
+        self.rank = _min_rank(self.rank, other.rank)
+        self.fusion_rank = _min_opt(self.fusion_rank, other.fusion_rank)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the evidence (used for trace export)."""
@@ -166,7 +206,7 @@ class EvidenceStore:
 
     Deduplicates on ``Evidence.dedup_key()`` so the same chunk retrieved by
     multiple subqueries is stored once. The first occurrence is kept (its
-    rank/score are authoritative), but the query *provenance* of later duplicates
+    rank/score are authoritative), but the query provenance of later duplicates
     is merged into it so ``retrieval_queries`` records every subquery that
     surfaced the chunk — subgoal-coverage signals depend on this.
     """

@@ -1,25 +1,25 @@
 """Strands-backed reasoning for the agentic RAG path.
 
-This module provides an *optional* third backend for the ``QueryPlanner`` and
+This module provides an optional third backend for the ``QueryPlanner`` and
 ``DecisionPolicy``, alongside the existing rule-based and (raw-Bedrock)
 LLM-backed modes. It uses the `Strands Agents <https://github.com/strands-agents>`_
-SDK driving **Bedrock Claude Sonnet 4.6** to emit *only* the plan or the action,
+SDK driving Bedrock Claude Sonnet 4.6 to emit only the plan or the action,
 while Python keeps deriving every tool/action argument deterministically.
 
-Design contract (why this is safe to bolt on):
+Why this is safe to bolt on:
 
-* **The LLM emits only the plan/action, never arguments.** Planning returns a
+* The LLM emits only the plan/action, never arguments. Planning returns a
   list of subquery strings; action selection returns a single value constrained
-  by a JSON-schema *enum* to the legal-action set the caller computed. The
+  by a JSON-schema enum to the legal-action set the caller computed. The
   planner's normalization (original query first, dedup, cap) and the policy's
   ``_build_args`` still run in Python, so a model response can never inject a
   tool argument or an illegal action.
-* **Structured output, not free text.** Strands' ``Agent.structured_output``
+* Structured output, not free text. Strands' ``Agent.structured_output``
   forces a Bedrock tool-use response validated against a Pydantic schema, so we
   get a typed object back instead of parsing prose. An Enum field becomes a
   JSON-schema ``enum``, which is exactly how "choose one of these actions" is
   expressed to the model.
-* **Never breaks the loop.** ``strands`` is imported lazily and every call is
+* Never breaks the loop. ``strands`` is imported lazily and every call is
   wrapped so any import error, credential/backend failure, or validation error
   returns ``None``; the caller then falls back to its LLM or rule-based path.
 
@@ -45,7 +45,13 @@ _PLAN_SYSTEM_PROMPT = (
     "question into focused search subqueries (subgoals) that, retrieved "
     "together, would surface the evidence needed to answer it. Do NOT answer the "
     "question. Prefer a single subquery for simple questions; only split when the "
-    "question bundles distinct information needs (e.g. multi-hop or comparison)."
+    "question bundles distinct information needs (e.g. multi-hop or comparison). "
+    "When a later subquery needs the ANSWER to an earlier one (a bridge entity the "
+    "question never names -- e.g. the band a person formed, then that band's home "
+    "city), order the earlier subquery first and refer to its answer with a 1-based "
+    "back-reference '#n' (n = the earlier subquery's position). Example: for 'In what "
+    "city was the band Danko Jones formed?' -> ['What band did Danko Jones form?', "
+    "'In what city was #1 formed?']. Use '#n' ONLY for a genuine dependency."
 )
 
 
